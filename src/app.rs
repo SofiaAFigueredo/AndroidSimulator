@@ -2,7 +2,7 @@
 //! painel inferior e barra de status.
 
 use crate::avd;
-use crate::catalog::{self, Catalog, Kind, Package};
+use crate::catalog::{self, Catalog, Package, Profile};
 use crate::sdk::{self, Event};
 use eframe::egui::{self, Color32, RichText};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -46,6 +46,7 @@ pub struct App {
     accepted: BTreeSet<String>,
     selected_image: Option<String>,
     filter: String,
+    profile: Profile,
     queue: VecDeque<Package>,
     job: Option<Job>,
     pending_license: Option<Vec<Package>>,
@@ -80,6 +81,7 @@ impl App {
             catalog_rx: Some(rx),
             selected_image: None,
             filter: String::new(),
+            profile: Profile::Compact,
             queue: VecDeque::new(),
             job: None,
             pending_license: None,
@@ -161,23 +163,9 @@ impl App {
         });
     }
 
-    /// Pacotes que faltam para ter um emulador rodando com a imagem escolhida.
+    /// Pacotes que faltam para o perfil escolhido, mais a imagem selecionada.
     fn plan(&self) -> Vec<Package> {
-        let mut v = Vec::new();
-        for kind in [Kind::Emulator, Kind::PlatformTools] {
-            if let Some(p) = self.catalog.tool(kind)
-                && !self.installed.contains_key(&p.path)
-            {
-                v.push(p.clone());
-            }
-        }
-        if let Some(path) = &self.selected_image
-            && !self.installed.contains_key(path)
-            && let Some(p) = self.catalog.packages.iter().find(|p| &p.path == path)
-        {
-            v.push(p.clone());
-        }
-        v
+        self.catalog.plan(self.profile, self.selected_image.as_deref(), &|p| self.installed.contains_key(p))
     }
 
     fn request_install(&mut self, pkgs: Vec<Package>) {
@@ -288,12 +276,26 @@ impl App {
             return;
         }
 
-        ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("Filtrar (API, tipo, ABI)"));
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.profile, Profile::Compact, "Compacta");
+            ui.selectable_value(&mut self.profile, Profile::Complete, "Completa");
+        });
+        ui.label(
+            RichText::new(match self.profile {
+                Profile::Compact => "Só o necessário para rodar apps: emulador, adb e a imagem escolhida.",
+                Profile::Complete => {
+                    "Rodar e compilar: soma plataforma, build-tools, cmdline-tools, código-fonte do Android, NDK e CMake (versões mais recentes)."
+                }
+            })
+            .small()
+            .color(MUTED),
+        );
+        ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("Filtrar imagens (API, tipo, ABI)"));
         let filter = self.filter.to_lowercase();
         let smallest = self.catalog.images().first().map(|p| p.path.clone());
         let mut clicked = None;
         let mut remove = None;
-        let list_height = (ui.available_height() - 290.0).max(120.0);
+        let list_height = (ui.available_height() - 340.0).max(120.0);
         egui::ScrollArea::vertical().max_height(list_height).auto_shrink(false).show(ui, |ui| {
             for p in self.catalog.images() {
                 let label = format!(

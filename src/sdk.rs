@@ -63,12 +63,8 @@ pub fn accept_license(root: &Path, id: &str) -> std::io::Result<()> {
 }
 
 pub fn uninstall(root: &Path, pkg: &Package) -> Result<(), String> {
-    let dir = root.join(pkg.extract_dir());
-    let target = match pkg.path.split(';').next_back() {
-        Some(last) if pkg.path.contains(';') => dir.join(last),
-        _ => root.join(&pkg.path),
-    };
-    if target.starts_with(root) && target != root && target.exists() {
+    let target = root.join(pkg.install_dir());
+    if target != root && target.exists() {
         fs::remove_dir_all(&target).map_err(|e| e.to_string())?;
     }
     let mut map = installed(root);
@@ -112,7 +108,7 @@ pub fn install(root: &Path, pkg: &Package, emit: &mut dyn FnMut(Event)) -> Resul
     fs::rename(&part, &zip_path).map_err(io)?;
 
     emit(Event::Phase("Extraindo".into()));
-    let dest = root.join(pkg.extract_dir());
+    let dest = root.join(pkg.install_dir());
     fs::create_dir_all(&dest).map_err(io)?;
     extract(&zip_path, &dest)?;
     let _ = fs::remove_file(&zip_path);
@@ -123,13 +119,38 @@ pub fn install(root: &Path, pkg: &Package, emit: &mut dyn FnMut(Event)) -> Resul
     Ok(())
 }
 
+/// A pasta raiz comum a todas as entradas, se houver exatamente uma.
+fn common_root(zip: &mut zip::ZipArchive<File>) -> Option<PathBuf> {
+    let mut root: Option<PathBuf> = None;
+    for i in 0..zip.len() {
+        let name = zip.by_index(i).ok()?.enclosed_name()?;
+        let first = PathBuf::from(name.components().next()?.as_os_str());
+        match &root {
+            None => root = Some(first),
+            Some(r) if *r == first => {}
+            Some(_) => return None,
+        }
+    }
+    root
+}
+
 fn extract(zip_path: &Path, dest: &Path) -> Result<(), String> {
     let mut zip = zip::ZipArchive::new(File::open(zip_path).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
+    // Os zips do Google trazem uma única pasta raiz (`android-15/`, `x86/`…), que o
+    // sdkmanager descarta: o conteúdo vai direto para a pasta do pacote.
+    let strip = common_root(&mut zip);
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).map_err(|e| e.to_string())?;
         // enclosed_name rejeita caminhos que escapam do destino (zip-slip).
         let Some(rel) = entry.enclosed_name() else { continue };
+        let rel = match &strip {
+            Some(root) => match rel.strip_prefix(root) {
+                Ok(r) if !r.as_os_str().is_empty() => r.to_owned(),
+                _ => continue,
+            },
+            None => rel,
+        };
         let target = dest.join(rel);
         if entry.is_dir() {
             fs::create_dir_all(&target).map_err(|e| e.to_string())?;

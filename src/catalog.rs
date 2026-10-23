@@ -19,6 +19,40 @@ pub enum Kind {
     Emulator,
     PlatformTools,
     SystemImage,
+    Platform,
+    BuildTools,
+    CmdlineTools,
+    Sources,
+    Ndk,
+    Cmake,
+}
+
+/// Perfil de instalação: o que baixar de uma vez, sempre na versão mais recente.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Profile {
+    /// Só o necessário para rodar um app: emulador, adb e a imagem escolhida.
+    Compact,
+    /// Rodar e compilar: a Compacta mais plataforma, build-tools, cmdline-tools,
+    /// código-fonte do Android, NDK e CMake.
+    Complete,
+}
+
+impl Profile {
+    pub fn kinds(self) -> &'static [Kind] {
+        match self {
+            Profile::Compact => &[Kind::Emulator, Kind::PlatformTools],
+            Profile::Complete => &[
+                Kind::Emulator,
+                Kind::PlatformTools,
+                Kind::Platform,
+                Kind::BuildTools,
+                Kind::CmdlineTools,
+                Kind::Sources,
+                Kind::Ndk,
+                Kind::Cmake,
+            ],
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -47,12 +81,14 @@ impl Package {
         format!("{a}.{b}.{c}")
     }
 
-    /// Diretório (relativo ao SDK) em que o zip é extraído. Os zips de imagem
-    /// trazem a pasta da ABI na raiz; os de emulator/platform-tools, a própria pasta.
-    pub fn extract_dir(&self) -> std::path::PathBuf {
-        let parts: Vec<&str> = self.path.split(';').collect();
-        let keep = if parts.len() > 1 { parts.len() - 1 } else { 0 };
-        parts[..keep].iter().collect()
+    /// Pasta do pacote dentro do SDK (`build-tools;35.0.0` vira `build-tools/35.0.0`).
+    /// O zip traz uma pasta raiz com outro nome, que é descartada na extração.
+    pub fn install_dir(&self) -> std::path::PathBuf {
+        self.path.split(';').collect()
+    }
+
+    fn api_number(&self) -> Option<f32> {
+        self.path.rsplit_once("android-").and_then(|(_, n)| n.parse().ok())
     }
 }
 
@@ -75,7 +111,38 @@ impl Catalog {
     }
 
     pub fn tool(&self, kind: Kind) -> Option<&Package> {
-        self.packages.iter().find(|p| p.kind == kind)
+        self.latest(kind)
+    }
+
+    /// A versão estável mais recente de cada tipo de pacote.
+    pub fn latest(&self, kind: Kind) -> Option<&Package> {
+        let of_kind = self.packages.iter().filter(|p| p.kind == kind);
+        match kind {
+            Kind::Platform => of_kind
+                .filter_map(|p| p.api_number().map(|n| (n, p)))
+                .max_by(|a, b| a.0.total_cmp(&b.0))
+                .map(|(_, p)| p),
+            Kind::Sources => {
+                let api = self.latest(Kind::Platform)?.api_number()?;
+                of_kind.into_iter().find(|p| p.api_number() == Some(api))
+            }
+            Kind::BuildTools => of_kind.filter(|p| !p.path.contains("rc")).max_by_key(|p| p.revision),
+            _ => of_kind.max_by_key(|p| p.revision),
+        }
+    }
+
+    /// O que baixar para o perfil e a imagem escolhida, sem repetir o que já está instalado.
+    pub fn plan(&self, profile: Profile, image: Option<&str>, installed: &dyn Fn(&str) -> bool) -> Vec<Package> {
+        let mut v: Vec<Package> = profile
+            .kinds()
+            .iter()
+            .filter_map(|k| self.latest(*k))
+            .chain(image.and_then(|path| self.packages.iter().find(|p| p.path == path)))
+            .filter(|p| !installed(&p.path))
+            .cloned()
+            .collect();
+        v.dedup_by(|a, b| a.path == b.path);
+        v
     }
 }
 
@@ -146,14 +213,17 @@ pub fn parse(xml: &str, base_dir: &str) -> Result<Catalog, String> {
         {
             continue;
         }
-        let kind = if path == "emulator" {
-            Kind::Emulator
-        } else if path == "platform-tools" {
-            Kind::PlatformTools
-        } else if path.starts_with("system-images;") {
-            Kind::SystemImage
-        } else {
-            continue;
+        let kind = match path {
+            "emulator" => Kind::Emulator,
+            "platform-tools" => Kind::PlatformTools,
+            p if p.starts_with("system-images;") => Kind::SystemImage,
+            p if p.starts_with("platforms;android-") => Kind::Platform,
+            p if p.starts_with("build-tools;") => Kind::BuildTools,
+            p if p.starts_with("cmdline-tools;") => Kind::CmdlineTools,
+            p if p.starts_with("sources;android-") => Kind::Sources,
+            p if p.starts_with("ndk;") => Kind::Ndk,
+            p if p.starts_with("cmake;") => Kind::Cmake,
+            _ => continue,
         };
         let Some(archives) = child(n, "archives") else { continue };
         let Some(complete) = archives
@@ -264,15 +334,105 @@ mod tests {
         assert_eq!(c.licenses["lic-a"], "Termos de teste");
     }
 
+    fn pkg(path: &str, kind: Kind, rev: u32, size: u64) -> Package {
+        Package {
+            path: path.into(),
+            name: path.into(),
+            kind,
+            api: None,
+            abi: None,
+            revision: (rev, 0, 0),
+            size,
+            url: String::new(),
+            sha1: String::new(),
+            license: String::new(),
+        }
+    }
+
+    fn sample() -> Catalog {
+        Catalog {
+            packages: vec![
+                pkg("emulator", Kind::Emulator, 37, 400),
+                pkg("platform-tools", Kind::PlatformTools, 37, 8),
+                pkg("platforms;android-34", Kind::Platform, 3, 60),
+                pkg("platforms;android-36", Kind::Platform, 2, 70),
+                pkg("platforms;android-35", Kind::Platform, 2, 65),
+                pkg("sources;android-34", Kind::Sources, 1, 40),
+                pkg("sources;android-36", Kind::Sources, 1, 45),
+                pkg("build-tools;35.0.0", Kind::BuildTools, 35, 55),
+                pkg("build-tools;36.0.0", Kind::BuildTools, 36, 60),
+                pkg("build-tools;37.0.0-rc1", Kind::BuildTools, 37, 61),
+                pkg("ndk;27.0.1", Kind::Ndk, 27, 900),
+                pkg("ndk;28.0.1", Kind::Ndk, 28, 1000),
+                pkg("cmake;3.22.1", Kind::Cmake, 3, 20),
+                pkg("cmdline-tools;19.0", Kind::CmdlineTools, 19, 150),
+            ],
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn extract_dir_drops_last_segment_for_images_only() {
-        let c = parse(XML, "https://h/dir").unwrap();
+    fn install_dir_mirrors_the_package_path() {
+        assert_eq!(pkg("emulator", Kind::Emulator, 1, 1).install_dir(), std::path::PathBuf::from("emulator"));
         assert_eq!(
-            c.packages[0].extract_dir(),
-            std::path::PathBuf::from("system-images/android-10/default")
+            pkg("system-images;android-10;default;x86", Kind::SystemImage, 1, 1).install_dir(),
+            std::path::PathBuf::from("system-images/android-10/default/x86")
         );
-        let mut tool = c.packages[0].clone();
-        tool.path = "emulator".into();
-        assert_eq!(tool.extract_dir(), std::path::PathBuf::new());
+        assert_eq!(
+            pkg("build-tools;35.0.0", Kind::BuildTools, 1, 1).install_dir(),
+            std::path::PathBuf::from("build-tools/35.0.0")
+        );
+    }
+
+    #[test]
+    fn latest_picks_newest_stable_and_matching_sources() {
+        let c = sample();
+        assert_eq!(c.latest(Kind::Platform).unwrap().path, "platforms;android-36");
+        assert_eq!(c.latest(Kind::Sources).unwrap().path, "sources;android-36");
+        assert_eq!(c.latest(Kind::BuildTools).unwrap().path, "build-tools;36.0.0");
+        assert_eq!(c.latest(Kind::Ndk).unwrap().path, "ndk;28.0.1");
+    }
+
+    #[test]
+    fn compact_is_a_subset_of_complete_and_skips_installed() {
+        let c = sample();
+        let none = |_: &str| false;
+        let compact: Vec<String> = c.plan(Profile::Compact, None, &none).into_iter().map(|p| p.path).collect();
+        let complete: Vec<String> = c.plan(Profile::Complete, None, &none).into_iter().map(|p| p.path).collect();
+        assert_eq!(compact, ["emulator", "platform-tools"]);
+        assert!(complete.contains(&"platforms;android-36".to_string()));
+        assert!(complete.contains(&"build-tools;36.0.0".to_string()));
+        let with_image = c.plan(Profile::Compact, Some("platforms;android-34"), &none);
+        assert_eq!(with_image.last().unwrap().path, "platforms;android-34");
+        assert!(compact.iter().all(|p| complete.contains(p)));
+        assert!(complete.contains(&"ndk;28.0.1".to_string()) && !compact.contains(&"ndk;28.0.1".to_string()));
+        let have = |p: &str| p == "emulator";
+        assert!(!c.plan(Profile::Compact, None, &have).iter().any(|p| p.path == "emulator"));
+    }
+}
+
+#[cfg(test)]
+mod network_tests {
+    use super::*;
+
+    /// Confere os perfis contra o catálogo real. Rode com `cargo test -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "usa a rede"]
+    fn profiles_on_the_real_catalog() {
+        let (cat, warnings) = fetch_all();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let image = cat.images().first().map(|p| p.path.clone());
+        for profile in [Profile::Compact, Profile::Complete] {
+            let plan = cat.plan(profile, image.as_deref(), &|_| false);
+            let total: u64 = plan.iter().map(|p| p.size).sum();
+            println!("{profile:?}: {} pacotes, {}", plan.len(), human_size(total));
+            for p in &plan {
+                println!("  {:<42} {}", p.path, human_size(p.size));
+            }
+            assert!(plan.iter().any(|p| p.kind == Kind::Emulator));
+        }
+        let complete = cat.plan(Profile::Complete, None, &|_| false);
+        assert!(complete.iter().any(|p| p.kind == Kind::Ndk && !p.path.contains("rc")));
+        assert!(complete.iter().any(|p| p.kind == Kind::Sources));
     }
 }
