@@ -248,7 +248,8 @@ mod tests {
             let port = 5580;
             let mut child = launch(&root, &name, &Launch { headless: true, port }).unwrap();
             let r = wait_boot(&root, &mut child, port, Duration::from_secs(240));
-            println!("RESULTADO {path}: {r:?}");
+            let sdk = adb(&root, &["-s", &serial(port), "shell", "getprop", "ro.build.version.sdk"]).unwrap_or_default();
+            println!("RESULTADO {path}: {r:?} (ro.build.version.sdk={sdk})");
             stop(&root, &mut child, port);
             let _ = delete(&root, &name);
         }
