@@ -22,7 +22,19 @@ tipo, ABI e tamanho, e baixa só o que o usuário escolher para uma pasta própr
 | Compacta | emulador, adb e a imagem escolhida: o necessário para **rodar** apps | 514 MB com a imagem de 72 MB |
 | Completa | a Compacta mais plataforma, build-tools, cmdline-tools, fontes do Android, NDK e CMake | 1,5 GB |
 
-Sempre a versão estável mais recente de cada ferramenta. JDK e Gradle (necessários para compilar) ainda não entram.
+Sempre a versão estável mais recente de cada ferramenta. A Completa também baixa o JDK (Eclipse
+Temurin 21, da Adoptium) e o Gradle 9.8.2, com o SHA-256 conferido, para compilar apps.
+
+## Criar e compilar um projeto
+
+No Explorador, **Novo projeto** gera um app Kotlin (plugin do Android para Gradle 9.4.1, Kotlin embutido,
+sem AndroidX) e **Compilar** roda `gradle assembleDebug` com o JDK, o SDK e o cache do Gradle do próprio
+app, mostrando a saída no painel inferior. Verificado de ponta a ponta: o projeto novo compila em ~1 min
+(depois de baixar o plugin e as dependências) e gera um APK de ~855 KB.
+`cargo test builds_a_new_project -- --ignored --nocapture`
+
+O app grava o `package.xml` de cada pacote instalado, como o sdkmanager faz; sem ele o AGP não reconhece
+a plataforma como instalada.
 
 ## Imagem mínima testada
 
@@ -44,7 +56,8 @@ snapshot, levou cerca de 175 s. A menor imagem API 30+ do catálogo é a `androi
 - [x] Syntax highlight (Kotlin, Java, XML) e números de linha
 - [x] Criar, iniciar e parar AVDs (instalar APK ainda não)
 - [ ] Logcat e terminal
-- [ ] Build via Gradle, com erros clicáveis
+- [x] Build via Gradle (saída no painel; erros clicáveis ainda não)
+- [ ] Instalar o APK no emulador e abrir o app
 - [ ] Autocomplete via LSP
 
 ## Rodar

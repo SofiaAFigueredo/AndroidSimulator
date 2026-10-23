@@ -4,6 +4,8 @@
 use crate::avd;
 use crate::catalog::{self, Catalog, Package, Profile};
 use crate::highlight;
+use crate::project;
+use crate::toolchain;
 use crate::sdk::{self, Event};
 use eframe::egui::{self, Color32, RichText};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -30,6 +32,11 @@ struct Tab {
     path: PathBuf,
     text: String,
     dirty: bool,
+}
+
+enum BuildMsg {
+    Line(String),
+    Done(Result<Option<PathBuf>, String>),
 }
 
 struct Job {
@@ -59,6 +66,9 @@ pub struct App {
     active: usize,
     avds: Vec<String>,
     running: Vec<(String, u16, std::process::Child)>,
+    new_project: Option<(String, String)>,
+    build_rx: Option<Receiver<BuildMsg>>,
+    last_apk: Option<PathBuf>,
     log: Vec<String>,
 }
 
@@ -100,6 +110,9 @@ impl App {
             active: 0,
             avds,
             running: Vec::new(),
+            new_project: None,
+            build_rx: None,
+            last_apk: None,
             log: vec!["Lendo o catálogo oficial do Google…".into()],
         };
         if let Some(file) = args.get(1) {
@@ -118,11 +131,35 @@ impl App {
                 cat.images().len()
             ));
             self.log.extend(warnings.into_iter().map(|w| format!("Aviso: {w}")));
+            sdk::ensure_metadata(&self.sdk_root, &cat);
             self.selected_image = cat.images().first().map(|p| p.path.clone());
             self.catalog = cat;
             self.catalog_rx = None;
         }
 
+        let mut build_done = None;
+        if let Some(rx) = &self.build_rx {
+            while let Ok(m) = rx.try_recv() {
+                match m {
+                    BuildMsg::Line(l) => self.log.push(l),
+                    BuildMsg::Done(r) => build_done = Some(r),
+                }
+            }
+        }
+        if let Some(r) = build_done {
+            self.build_rx = None;
+            match r {
+                Ok(Some(apk)) => {
+                    self.log.push(format!("APK pronto: {}", apk.display()));
+                    self.last_apk = Some(apk);
+                }
+                Ok(None) => self.log.push("Build concluído, mas não achei o APK.".into()),
+                Err(e) => self.log.push(format!("Erro no build: {e}")),
+            }
+        }
+        if self.log.len() > 5000 {
+            self.log.drain(..self.log.len() - 5000);
+        }
         self.running.retain_mut(|(_, _, c)| c.try_wait().map(|s| s.is_none()).unwrap_or(false));
         let mut finished = None;
         if let Some(job) = &mut self.job {
@@ -182,7 +219,7 @@ impl App {
     }
 
     fn request_install(&mut self, pkgs: Vec<Package>) {
-        if pkgs.iter().any(|p| !self.accepted.contains(&p.license)) {
+        if pkgs.iter().any(|p| !p.license.is_empty() && !self.accepted.contains(&p.license)) {
             self.pending_license = Some(pkgs);
         } else {
             self.queue.extend(pkgs);
@@ -260,6 +297,27 @@ impl App {
                 self.folder = PathBuf::from(&self.folder_input);
             }
         });
+        let versions = self.build_versions();
+        let is_project = self.folder.join("settings.gradle.kts").exists();
+        ui.horizontal(|ui| {
+            if ui.button("Novo projeto").clicked() {
+                self.new_project = Some(("Meu App".into(), "com.exemplo.meuapp".into()));
+            }
+            let can_build = is_project && versions.is_some() && self.build_rx.is_none();
+            let hint = if !is_project {
+                "Abra uma pasta com um projeto Android"
+            } else if versions.is_none() {
+                "Baixe o perfil Completa (JDK, Gradle, plataforma e build-tools)"
+            } else {
+                "Compilando…"
+            };
+            if ui.add_enabled(can_build, egui::Button::new("Compilar")).on_disabled_hover_text(hint).clicked() {
+                self.compile(ui.ctx());
+            }
+        });
+        if let Some(apk) = &self.last_apk {
+            ui.label(RichText::new(format!("APK: {}", apk.display())).small().color(MUTED));
+        }
         ui.separator();
         let mut to_open = None;
         egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
@@ -441,12 +499,107 @@ impl App {
         }
     }
 
+    /// API da plataforma e build-tools mais novos instalados; `None` se faltar o que compilar exige.
+    fn build_versions(&self) -> Option<(u32, String)> {
+        let has = |p: &str| self.installed.contains_key(p);
+        if !has(&format!("jdk;{}", toolchain::JDK_MAJOR)) || !has(&format!("gradle;{}", toolchain::GRADLE_VERSION)) {
+            return None;
+        }
+        let api = self
+            .installed
+            .keys()
+            .filter_map(|k| catalog::platform_api(k))
+            .max()?;
+        let version = |v: &str| v.split('.').filter_map(|n| n.parse::<u32>().ok()).collect::<Vec<_>>();
+        let bt = self
+            .installed
+            .keys()
+            .filter_map(|k| k.strip_prefix("build-tools;"))
+            .filter(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'))
+            .max_by_key(|v| version(v))?;
+        Some((api, bt.to_owned()))
+    }
+
+    fn compile(&mut self, ctx: &egui::Context) {
+        if self.build_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let (root, project, ctx) = (self.sdk_root.clone(), self.folder.clone(), ctx.clone());
+        self.log.push(format!("Compilando {}…", project.display()));
+        self.build_rx = Some(rx);
+        std::thread::spawn(move || {
+            let r = project::build(&root, &project, "assembleDebug", &mut |l| {
+                let _ = tx.send(BuildMsg::Line(l.to_owned()));
+                ctx.request_repaint();
+            });
+            let _ = tx.send(BuildMsg::Done(r));
+            ctx.request_repaint();
+        });
+    }
+
+    fn new_project_window(&mut self, ctx: &egui::Context) {
+        let folder = self.folder.clone();
+        let versions = self.build_versions();
+        let Some((name, package)) = &mut self.new_project else { return };
+        let slug: String = name
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_owned();
+        let target = folder.join(&slug);
+        let mut decision = None;
+        egui::Window::new("Novo projeto Android")
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label("Nome do app");
+                ui.text_edit_singleline(name);
+                ui.label("Pacote");
+                ui.text_edit_singleline(package);
+                ui.label(RichText::new(format!("Será criado em {}", target.display())).small().color(MUTED));
+                if versions.is_none() {
+                    ui.colored_label(Color32::LIGHT_YELLOW, "Para compilar, baixe antes o perfil Completa.");
+                }
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!slug.is_empty(), egui::Button::new("Criar")).clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button("Cancelar").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        let Some(create) = decision else { return };
+        if create && let Some((name, package)) = self.new_project.clone() {
+            let (api, bt) = versions.unwrap_or((catalog::MAX_PLATFORM_API as u32, "36.0.0".into()));
+            let spec = project::NewProject { name: &name, package: &package, compile_sdk: api, build_tools: &bt, sdk_root: &self.sdk_root };
+            match project::create(&target, &spec) {
+                Ok(()) => {
+                    self.log.push(format!("Projeto criado em {}.", target.display()));
+                    self.folder_input = target.display().to_string();
+                    self.folder = target.clone();
+                    let main: PathBuf = package.split('.').collect();
+                    self.open_file(&target.join("app/src/main/java").join(main).join("MainActivity.kt"));
+                    self.view = View::Explorer;
+                }
+                Err(e) => {
+                    self.log.push(format!("Não criei o projeto: {e}"));
+                    return;
+                }
+            }
+        }
+        self.new_project = None;
+    }
+
     fn license_window(&mut self, ctx: &egui::Context) {
         let Some(pkgs) = &self.pending_license else { return };
         let mut ids: Vec<String> = pkgs
             .iter()
             .map(|p| p.license.clone())
-            .filter(|l| !self.accepted.contains(l))
+            .filter(|l| !l.is_empty() && !self.accepted.contains(l))
             .collect();
         ids.sort();
         ids.dedup();
@@ -644,8 +797,9 @@ impl eframe::App for App {
         self.sidebar(ui);
         egui::CentralPanel::default().show(ui, |ui| self.editor(ui));
         self.license_window(ctx);
+        self.new_project_window(ctx);
 
-        if self.job.is_some() {
+        if self.job.is_some() || self.build_rx.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
     }

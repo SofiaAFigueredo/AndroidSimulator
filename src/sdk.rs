@@ -3,6 +3,7 @@
 
 use crate::catalog::Package;
 use sha1::{Digest, Sha1};
+use sha2::Sha256;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -84,7 +85,10 @@ pub fn install(root: &Path, pkg: &Package, emit: &mut dyn FnMut(Event)) -> Resul
     let resp = ureq::get(&pkg.url).call().map_err(|e| e.to_string())?;
     let mut body = resp.into_body().into_reader();
     let mut out = File::create(&part).map_err(io)?;
-    let mut hasher = Sha1::new();
+    // 40 hex = SHA-1 (catálogo do Google); 64 hex = SHA-256 (JDK e Gradle).
+    let sha256 = pkg.checksum.len() == 64;
+    let mut sha1 = Sha1::new();
+    let mut sha2 = Sha256::new();
     let mut buf = vec![0u8; 256 * 1024];
     let mut done = 0u64;
     loop {
@@ -92,18 +96,26 @@ pub fn install(root: &Path, pkg: &Package, emit: &mut dyn FnMut(Event)) -> Resul
         if n == 0 {
             break;
         }
-        hasher.update(&buf[..n]);
+        if sha256 {
+            sha2.update(&buf[..n]);
+        } else {
+            sha1.update(&buf[..n]);
+        }
         out.write_all(&buf[..n]).map_err(io)?;
         done += n as u64;
         emit(Event::Downloaded(done));
     }
     drop(out);
 
-    emit(Event::Phase("Verificando SHA-1".into()));
-    let got: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    if !got.eq_ignore_ascii_case(&pkg.sha1) {
+    emit(Event::Phase(format!("Verificando {}", if sha256 { "SHA-256" } else { "SHA-1" })));
+    let got: String = if sha256 {
+        sha2.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    } else {
+        sha1.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    };
+    if !got.eq_ignore_ascii_case(&pkg.checksum) {
         let _ = fs::remove_file(&part);
-        return Err(format!("SHA-1 não confere (esperado {}, obtido {got})", pkg.sha1));
+        return Err(format!("hash não confere (esperado {}, obtido {got})", pkg.checksum));
     }
     fs::rename(&part, &zip_path).map_err(io)?;
 
@@ -113,10 +125,31 @@ pub fn install(root: &Path, pkg: &Package, emit: &mut dyn FnMut(Event)) -> Resul
     extract(&zip_path, &dest)?;
     let _ = fs::remove_file(&zip_path);
 
+    write_package_xml(root, pkg).map_err(io)?;
     let mut map = installed(root);
     map.insert(pkg.path.clone(), pkg.revision_text());
     write_installed(root, &map).map_err(io)?;
     Ok(())
+}
+
+/// Grava o `package.xml` que o sdkmanager grava; sem ele o AGP não reconhece o pacote instalado.
+fn write_package_xml(root: &Path, pkg: &Package) -> std::io::Result<()> {
+    if pkg.package_xml.is_empty() {
+        return Ok(());
+    }
+    fs::write(root.join(pkg.install_dir()).join("package.xml"), &pkg.package_xml)
+}
+
+/// Completa o `package.xml` dos pacotes instalados antes de o app gravá-lo. Só mexe nos que estão na
+/// mesma revisão do catálogo, para não descrever um pacote com os dados de outra versão.
+pub fn ensure_metadata(root: &Path, catalog: &crate::catalog::Catalog) {
+    for (path, revision) in installed(root) {
+        let Some(pkg) = catalog.packages.iter().find(|p| p.path == path) else { continue };
+        let missing = !root.join(pkg.install_dir()).join("package.xml").exists();
+        if missing && pkg.revision_text() == revision {
+            let _ = write_package_xml(root, pkg);
+        }
+    }
 }
 
 /// A pasta raiz comum a todas as entradas, se houver exatamente uma.
@@ -179,8 +212,8 @@ mod tests {
     #[ignore = "usa a rede"]
     fn installs_platform_tools_end_to_end() {
         let (cat, warnings) = crate::catalog::fetch_all();
-        assert!(cat.tool(crate::catalog::Kind::PlatformTools).is_some(), "{warnings:?}");
-        let pkg = cat.tool(crate::catalog::Kind::PlatformTools).unwrap();
+        assert!(cat.latest(crate::catalog::Kind::PlatformTools).is_some(), "{warnings:?}");
+        let pkg = cat.latest(crate::catalog::Kind::PlatformTools).unwrap();
         let root = std::env::temp_dir().join(format!("andsim-test-{}", std::process::id()));
         install(&root, pkg, &mut |_| {}).expect("install");
         assert!(root.join("platform-tools").join(if cfg!(windows) { "adb.exe" } else { "adb" }).exists());

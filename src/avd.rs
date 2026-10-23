@@ -202,8 +202,9 @@ mod tests {
             revision: (1, 0, 0),
             size: 1,
             url: String::new(),
-            sha1: String::new(),
+            checksum: String::new(),
             license: String::new(),
+            package_xml: String::new(),
         }
     }
 

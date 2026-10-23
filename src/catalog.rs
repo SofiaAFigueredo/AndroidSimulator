@@ -2,6 +2,9 @@
 
 use std::collections::HashMap;
 
+/// Maior API que o plugin do Android para Gradle do modelo suporta (AGP 9.4).
+pub const MAX_PLATFORM_API: f32 = 37.0;
+
 pub const BASE: &str = "https://dl.google.com/android/repository";
 
 /// Catálogos consultados. Os de imagens de sistema são opcionais: se um falhar,
@@ -25,6 +28,8 @@ pub enum Kind {
     Sources,
     Ndk,
     Cmake,
+    Jdk,
+    Gradle,
 }
 
 /// Perfil de instalação: o que baixar de uma vez, sempre na versão mais recente.
@@ -50,6 +55,8 @@ impl Profile {
                 Kind::Sources,
                 Kind::Ndk,
                 Kind::Cmake,
+                Kind::Jdk,
+                Kind::Gradle,
             ],
         }
     }
@@ -65,8 +72,11 @@ pub struct Package {
     pub revision: (u32, u32, u32),
     pub size: u64,
     pub url: String,
-    pub sha1: String,
+    /// SHA-1 (40 hex, catálogo do Google) ou SHA-256 (64 hex, JDK e Gradle).
+    pub checksum: String,
     pub license: String,
+    /// Conteúdo do `package.xml` que o sdkmanager grava na pasta do pacote (vazio fora do catálogo do Google).
+    pub package_xml: String,
 }
 
 #[derive(Default, Debug)]
@@ -110,16 +120,12 @@ impl Catalog {
         v
     }
 
-    pub fn tool(&self, kind: Kind) -> Option<&Package> {
-        self.latest(kind)
-    }
-
     /// A versão estável mais recente de cada tipo de pacote.
     pub fn latest(&self, kind: Kind) -> Option<&Package> {
         let of_kind = self.packages.iter().filter(|p| p.kind == kind);
         match kind {
             Kind::Platform => of_kind
-                .filter_map(|p| p.api_number().map(|n| (n, p)))
+                .filter_map(|p| p.api_number().filter(|n| n.fract() == 0.0 && *n <= MAX_PLATFORM_API).map(|n| (n, p)))
                 .max_by(|a, b| a.0.total_cmp(&b.0))
                 .map(|(_, p)| p),
             Kind::Sources => {
@@ -178,6 +184,51 @@ fn child<'a, 'b>(n: Node<'a, 'b>, name: &str) -> Option<Node<'a, 'b>> {
     n.children().find(|c| c.is_element() && c.tag_name().name() == name)
 }
 
+/// `package.xml` de um pacote instalado: o mesmo `remotePackage` do catálogo, como `localPackage`,
+/// sem `archives` e `channelRef`, dentro de um `repository` com os namespaces do catálogo e a licença.
+/// O AGP e o sdkmanager só reconhecem como instalado o pacote que tem esse arquivo.
+fn local_xml(src: &str, root: Node, node: Node, license_xml: &HashMap<String, String>) -> String {
+    const COMMON: &str = "http://schemas.android.com/repository/android/common/02";
+    let prefix = root
+        .namespaces()
+        .find(|n| n.uri() == COMMON)
+        .and_then(|n| n.name())
+        .unwrap_or("ns2")
+        .to_owned();
+    let mut decls = String::new();
+    for ns in root.namespaces() {
+        match ns.name() {
+            Some(p) => decls += &format!(" xmlns:{p}=\"{}\"", ns.uri()),
+            None => decls += &format!(" xmlns=\"{}\"", ns.uri()),
+        }
+    }
+    if !root.namespaces().any(|n| n.uri() == COMMON) {
+        decls += &format!(" xmlns:{prefix}=\"{COMMON}\"");
+    }
+    let base = node.range().start;
+    let mut cuts: Vec<std::ops::Range<usize>> = node
+        .children()
+        .filter(|c| c.is_element() && matches!(c.tag_name().name(), "archives" | "channelRef"))
+        .map(|c| c.range())
+        .collect();
+    cuts.sort_by_key(|r| std::cmp::Reverse(r.start));
+    let mut body = src[node.range()].to_owned();
+    for r in cuts {
+        body.replace_range(r.start - base..r.end - base, "");
+    }
+    let body = body.replacen("<remotePackage", "<localPackage", 1);
+    let body = match body.rfind("</remotePackage>") {
+        Some(i) => format!("{}</localPackage>", &body[..i]),
+        None => body,
+    };
+    let license = child(node, "uses-license")
+        .and_then(|l| l.attribute("ref"))
+        .and_then(|id| license_xml.get(id))
+        .cloned()
+        .unwrap_or_default();
+    format!("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><{prefix}:repository{decls}>{license}{body}</{prefix}:repository>")
+}
+
 fn text(n: Node, name: &str) -> Option<String> {
     child(n, name).and_then(|c| c.text()).map(|t| t.trim().to_owned())
 }
@@ -188,11 +239,13 @@ pub fn parse(xml: &str, base_dir: &str) -> Result<Catalog, String> {
     let root = doc.root_element();
     let mut cat = Catalog::default();
     let mut stable: Vec<String> = Vec::new();
+    let mut license_xml: HashMap<String, String> = HashMap::new();
 
     for n in root.children().filter(|n| n.is_element()) {
         match n.tag_name().name() {
             "license" => {
                 if let (Some(id), Some(t)) = (n.attribute("id"), n.text()) {
+                    license_xml.insert(id.to_owned(), xml[n.range()].to_owned());
                     cat.licenses.insert(id.to_owned(), t.trim().to_owned());
                 }
             }
@@ -237,7 +290,7 @@ pub fn parse(xml: &str, base_dir: &str) -> Result<Catalog, String> {
         else {
             continue;
         };
-        let (Some(file), Some(size), Some(sha1)) = (
+        let (Some(file), Some(size), Some(checksum)) = (
             text(complete, "url"),
             text(complete, "size").and_then(|s| s.parse::<u64>().ok()),
             text(complete, "checksum"),
@@ -256,11 +309,12 @@ pub fn parse(xml: &str, base_dir: &str) -> Result<Catalog, String> {
             revision: (num("major"), num("minor"), num("micro")),
             size,
             url: format!("{base_dir}/{file}"),
-            sha1,
+            checksum,
             license: child(n, "uses-license")
                 .and_then(|l| l.attribute("ref"))
                 .unwrap_or_default()
                 .to_owned(),
+            package_xml: local_xml(xml, root, n, &license_xml),
         };
         match best.get(path) {
             Some(old) if old.revision >= pkg.revision => {}
@@ -289,7 +343,17 @@ pub fn fetch_all() -> (Catalog, Vec<String>) {
             Err(e) => warnings.push(format!("{src}: {e}")),
         }
     }
+    let (tools, tool_warnings) = crate::toolchain::fetch_packages();
+    cat.packages.extend(tools);
+    warnings.extend(tool_warnings);
     (cat, warnings)
+}
+
+/// API inteira de um pacote `platforms;android-37.0` ou `platforms;android-36`; `None` para
+/// versões com extensão (`37.2`) ou prévias.
+pub fn platform_api(path: &str) -> Option<u32> {
+    let n: f32 = path.strip_prefix("platforms;android-")?.parse().ok()?;
+    (n.fract() == 0.0 && n <= MAX_PLATFORM_API).then_some(n as u32)
 }
 
 pub fn human_size(bytes: u64) -> String {
@@ -322,6 +386,17 @@ mod tests {
 </sys:sdk-sys-img>"#;
 
     #[test]
+    fn builds_a_local_package_xml() {
+        let c = parse(XML, "https://h/dir").unwrap();
+        let x = &c.packages[0].package_xml;
+        assert!(x.contains("<localPackage path=\"system-images;android-10;default;x86\""), "{x}");
+        assert!(!x.contains("archives") && !x.contains("channelRef") && !x.contains("remotePackage"), "{x}");
+        assert!(x.contains("Termos de teste"));
+        let doc = roxmltree::Document::parse(x).expect("package.xml deve ser XML válido");
+        assert_eq!(doc.root_element().tag_name().name(), "repository");
+    }
+
+    #[test]
     fn parses_stable_image_and_skips_the_rest() {
         let c = parse(XML, "https://h/dir").unwrap();
         assert_eq!(c.packages.len(), 1);
@@ -344,8 +419,9 @@ mod tests {
             revision: (rev, 0, 0),
             size,
             url: String::new(),
-            sha1: String::new(),
+            checksum: String::new(),
             license: String::new(),
+            package_xml: String::new(),
         }
     }
 
@@ -357,6 +433,8 @@ mod tests {
                 pkg("platforms;android-34", Kind::Platform, 3, 60),
                 pkg("platforms;android-36", Kind::Platform, 2, 70),
                 pkg("platforms;android-35", Kind::Platform, 2, 65),
+                pkg("platforms;android-37.2", Kind::Platform, 2, 70),
+                pkg("platforms;android-38", Kind::Platform, 2, 70),
                 pkg("sources;android-34", Kind::Sources, 1, 40),
                 pkg("sources;android-36", Kind::Sources, 1, 45),
                 pkg("build-tools;35.0.0", Kind::BuildTools, 35, 55),
@@ -434,5 +512,20 @@ mod network_tests {
         let complete = cat.plan(Profile::Complete, None, &|_| false);
         assert!(complete.iter().any(|p| p.kind == Kind::Ndk && !p.path.contains("rc")));
         assert!(complete.iter().any(|p| p.kind == Kind::Sources));
+    }
+}
+
+#[cfg(test)]
+mod platform_api_tests {
+    use super::*;
+
+    #[test]
+    fn reads_whole_apis_only() {
+        assert_eq!(platform_api("platforms;android-37.0"), Some(37));
+        assert_eq!(platform_api("platforms;android-36"), Some(36));
+        assert_eq!(platform_api("platforms;android-37.2"), None);
+        assert_eq!(platform_api("platforms;android-38"), None);
+        assert_eq!(platform_api("platforms;android-Baklava"), None);
+        assert_eq!(platform_api("build-tools;36.0.0"), None);
     }
 }

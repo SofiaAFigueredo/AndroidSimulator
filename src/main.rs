@@ -4,7 +4,9 @@ mod app;
 mod avd;
 mod catalog;
 mod highlight;
+mod project;
 mod sdk;
+mod toolchain;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
