@@ -190,4 +190,32 @@ mod tests {
         assert!(installed(&root).is_empty());
         let _ = fs::remove_dir_all(&root);
     }
+
+    /// Baixa pacotes pelo caminho para o SDK do app, exigindo licença já aceita na interface.
+    /// `ANDSIM_INSTALL="system-images;android-30;google_atd;x86" cargo test installs_listed -- --ignored --nocapture`
+    #[test]
+    #[ignore = "usa a rede"]
+    fn installs_listed_packages() {
+        let root = default_root();
+        let wanted = std::env::var("ANDSIM_INSTALL").expect("defina ANDSIM_INSTALL");
+        let (cat, _) = crate::catalog::fetch_all();
+        for path in wanted.split(',') {
+            let pkg = cat.packages.iter().find(|p| p.path == path).unwrap_or_else(|| panic!("{path} fora do catálogo"));
+            assert!(accepted_licenses(&root).contains(&pkg.license), "licença {} não aceita; aceite pelo app", pkg.license);
+            if installed(&root).contains_key(path) {
+                continue;
+            }
+            let mut last = 0;
+            install(&root, pkg, &mut |e| {
+                if let Event::Downloaded(n) = e
+                    && n / (100 << 20) > last
+                {
+                    last = n / (100 << 20);
+                    println!("  {path}: {} MB", n >> 20);
+                }
+            })
+            .expect("install");
+            println!("instalado {path}");
+        }
+    }
 }
