@@ -5,8 +5,10 @@ mod avd;
 mod catalog;
 mod diagnostics;
 mod highlight;
+mod logcat;
 mod project;
 mod sdk;
+mod terminal;
 mod toolchain;
 
 fn main() -> eframe::Result {

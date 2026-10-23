@@ -63,10 +63,22 @@ botão **Compactar imagens** faz o mesmo nas já instaladas. Medido nas três im
 - [x] Gerenciador de download do emulador com escolha da imagem
 - [x] Syntax highlight (Kotlin, Java, XML) e números de linha
 - [x] Criar, iniciar, parar e excluir AVDs
-- [ ] Logcat e terminal
+- [x] Logcat (filtro por nível e texto) e terminal integrado, em abas no painel inferior
 - [x] Build via Gradle, com erros do Kotlin, javac e aapt2 clicáveis no painel de saída
 - [x] Executar: instala o APK no emulador e abre o app; Captura salva a tela do emulador
 - [ ] Autocomplete via LSP
+
+## Logcat e terminal
+
+O painel inferior tem três abas: **Saída** (downloads, Gradle, emulador), **Logcat** e **Terminal**.
+
+- **Logcat:** lê `adb logcat -v threadtime` do primeiro emulador em execução, com filtro por nível e por
+  texto (tag, pacote, mensagem) e até 20 mil linhas em memória. Verificado no emulador: milhares de linhas
+  interpretadas e uma linha escrita pelo teste chegou com a tag e o nível certos.
+- **Terminal:** cada linha digitada roda no `cmd` (ou `sh`) na pasta do projeto, com `adb`, `gradle` e
+  `java` já no PATH e `JAVA_HOME` apontando para o JDK do app. Tem `cd`, `clear`, histórico (↑/↓) e o botão
+  Parar. Não é um PTY: programas interativos (vim, REPLs) não funcionam. Não usa nenhuma biblioteca de
+  terminal, para o binário continuar pequeno.
 
 ## Rodar
 

@@ -157,15 +157,21 @@ pub fn launch(root: &Path, name: &str, opts: &Launch) -> Result<Child, String> {
     cmd.spawn().map_err(|e| e.to_string())
 }
 
-pub fn adb(root: &Path, args: &[&str]) -> Result<String, String> {
+/// `adb` isolado (servidor, pasta de usuário e SDK do app) e sem janela de console no Windows.
+pub fn adb_command(root: &Path) -> Command {
     let mut cmd = Command::new(adb_path(root));
-    cmd.args(args);
     isolated(&mut cmd, root);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000);
     }
+    cmd
+}
+
+pub fn adb(root: &Path, args: &[&str]) -> Result<String, String> {
+    let mut cmd = adb_command(root);
+    cmd.args(args);
     let out = cmd.output().map_err(|e| e.to_string())?;
     let stdout = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     if out.status.success() {
@@ -177,14 +183,8 @@ pub fn adb(root: &Path, args: &[&str]) -> Result<String, String> {
 
 /// Captura a tela do emulador como PNG (`adb exec-out screencap -p`).
 pub fn screenshot(root: &Path, port: u16, out: &Path) -> Result<(), String> {
-    let mut cmd = Command::new(adb_path(root));
+    let mut cmd = adb_command(root);
     cmd.args(["-s", &serial(port), "exec-out", "screencap", "-p"]);
-    isolated(&mut cmd, root);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
     let o = cmd.output().map_err(|e| e.to_string())?;
     if !o.status.success() || !o.stdout.starts_with(&[0x89, b'P', b'N', b'G']) {
         return Err(format!("screencap falhou: {}", String::from_utf8_lossy(&o.stderr).trim()));

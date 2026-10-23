@@ -5,6 +5,8 @@ use crate::avd;
 use crate::diagnostics;
 use crate::catalog::{self, Catalog, Package, Profile};
 use crate::highlight;
+use crate::logcat::LogcatView;
+use crate::terminal::Terminal;
 use crate::project;
 use crate::toolchain;
 use crate::sdk::{self, Event};
@@ -22,6 +24,13 @@ const MUTED: Color32 = Color32::from_rgb(0x85, 0x85, 0x85);
 const MAX_OPEN_BYTES: u64 = 2 * 1024 * 1024;
 /// Acima disso o realce é desligado, porque o texto é re-analisado a cada quadro.
 const MAX_HIGHLIGHT_BYTES: usize = 300_000;
+
+#[derive(PartialEq, Clone, Copy)]
+enum Bottom {
+    Output,
+    Logcat,
+    Terminal,
+}
 
 #[derive(PartialEq, Clone, Copy)]
 enum View {
@@ -74,6 +83,11 @@ pub struct App {
     active: usize,
     avds: Vec<String>,
     running: Vec<(String, u16, std::process::Child)>,
+    bottom: Bottom,
+    logcat: LogcatView,
+    terminal: Terminal,
+    /// Pasta que o terminal seguiu da última vez; o `cd` do usuário não é desfeito a cada quadro.
+    term_folder: PathBuf,
     new_project: Option<(String, String)>,
     build_rx: Option<Receiver<BuildMsg>>,
     run_rx: Option<Receiver<RunMsg>>,
@@ -113,6 +127,10 @@ impl App {
             queue: VecDeque::new(),
             job: None,
             pending_license: None,
+            terminal: Terminal::new(folder.clone()),
+            term_folder: folder.clone(),
+            bottom: Bottom::Output,
+            logcat: LogcatView::default(),
             folder_input: folder.display().to_string(),
             folder,
             tabs: Vec::new(),
@@ -619,6 +637,31 @@ impl App {
         });
     }
 
+    /// Saída do app (downloads, Gradle, emulador). Linhas de erro com arquivo e linha abrem o editor.
+    fn output_view(&mut self, ui: &mut egui::Ui) {
+        let mut jump = None;
+        let row = ui.text_style_height(&egui::TextStyle::Small) + 2.0;
+        egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink(false).show_rows(ui, row, self.log.len(), |ui, range| {
+            for l in &self.log[range] {
+                match diagnostics::parse_line(l).filter(|d| d.path.is_file()) {
+                    Some(d) => {
+                        let color = if d.error { Color32::from_rgb(0xf4, 0x87, 0x71) } else { Color32::from_rgb(0xcc, 0xa7, 0x00) };
+                        let r = ui.add(egui::Label::new(RichText::new(l).monospace().small().color(color).underline()).sense(egui::Sense::click()));
+                        if r.on_hover_text("Abrir no editor").clicked() {
+                            jump = Some(d);
+                        }
+                    }
+                    None => {
+                        ui.label(RichText::new(l).monospace().small());
+                    }
+                }
+            }
+        });
+        if let Some(d) = jump {
+            self.open_file_at(&d.path, d.line);
+        }
+    }
+
     fn compact(&mut self, ctx: &egui::Context) {
         let (tx, rx) = mpsc::channel();
         let (root, ctx) = (self.sdk_root.clone(), ctx.clone());
@@ -883,6 +926,12 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
         self.poll(ctx);
+        self.logcat.poll();
+        self.terminal.poll();
+        if self.folder != self.term_folder {
+            self.term_folder = self.folder.clone();
+            self.terminal.set_cwd(self.folder.clone());
+        }
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
             self.save_active();
         }
@@ -905,32 +954,23 @@ impl eframe::App for App {
             .default_size(150.0)
             .frame(egui::Frame::new().fill(BG).inner_margin(8.0))
             .show(ui, |ui| {
-                ui.label(RichText::new("SAÍDA").small().color(MUTED));
-                let mut jump = None;
-                let row = ui.text_style_height(&egui::TextStyle::Small) + 2.0;
-                egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink(false).show_rows(
-                    ui,
-                    row,
-                    self.log.len(),
-                    |ui, range| {
-                        for l in &self.log[range] {
-                            match diagnostics::parse_line(l).filter(|d| d.path.is_file()) {
-                                Some(d) => {
-                                    let color = if d.error { Color32::from_rgb(0xf4, 0x87, 0x71) } else { Color32::from_rgb(0xcc, 0xa7, 0x00) };
-                                    let r = ui.add(egui::Label::new(RichText::new(l).monospace().small().color(color).underline()).sense(egui::Sense::click()));
-                                    if r.on_hover_text("Abrir no editor").clicked() {
-                                        jump = Some(d);
-                                    }
-                                }
-                                None => {
-                                    ui.label(RichText::new(l).monospace().small());
-                                }
-                            }
+                ui.horizontal(|ui| {
+                    for (tab, label) in [(Bottom::Output, "SAÍDA"), (Bottom::Logcat, "LOGCAT"), (Bottom::Terminal, "TERMINAL")] {
+                        if ui.selectable_label(self.bottom == tab, RichText::new(label).small()).clicked() {
+                            self.bottom = tab;
                         }
-                    },
-                );
-                if let Some(d) = jump {
-                    self.open_file_at(&d.path, d.line);
+                    }
+                });
+                match self.bottom {
+                    Bottom::Output => self.output_view(ui),
+                    Bottom::Logcat => {
+                        let port = self.running.first().map(|(_, p, _)| *p);
+                        self.logcat.ui(ui, &self.sdk_root, port);
+                    }
+                    Bottom::Terminal => {
+                        let ctx = ui.ctx().clone();
+                        self.terminal.ui(ui, &self.sdk_root, &ctx);
+                    }
                 }
             });
 
@@ -940,6 +980,9 @@ impl eframe::App for App {
         self.license_window(ctx);
         self.new_project_window(ctx);
 
+        if self.logcat.connected() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
         if self.job.is_some() || self.build_rx.is_some() || self.run_rx.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
