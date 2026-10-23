@@ -31,12 +31,17 @@ Sempre a versão estável mais recente de cada ferramenta. JDK e Gradle (necess�
 `ANDSIM_IMAGES="system-images;android-10;default;x86" cargo test boots_images -- --ignored --nocapture`.
 O API 10 é antigo; apps modernos exigem uma imagem mais nova.
 
+`system-images;android-30;google_atd;x86_64` (614 MB, ATD: sem tela inicial nem apps do sistema)
+também inicia e reporta `ro.build.version.sdk=30`, mas o primeiro boot a frio, sem janela e sem
+snapshot, levou cerca de 175 s. A menor imagem API 30+ do catálogo é a `android-30;google_atd;x86`
+(476 MB), ainda não testada.
+
 ## Estado atual
 
 - [x] Casca estilo VS Code: barra de atividades, barra lateral, abas, painel de saída, barra de status
 - [x] Explorador de arquivos e editor de texto com abas (Ctrl+S salva)
 - [x] Gerenciador de download do emulador com escolha da imagem
-- [ ] Syntax highlight (Kotlin, Java, XML)
+- [x] Syntax highlight (Kotlin, Java, XML) e números de linha
 - [x] Criar, iniciar e parar AVDs (instalar APK ainda não)
 - [ ] Logcat e terminal
 - [ ] Build via Gradle, com erros clicáveis
