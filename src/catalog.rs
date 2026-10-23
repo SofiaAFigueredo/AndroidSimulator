@@ -5,6 +5,9 @@ use std::collections::HashMap;
 /// Maior API que o plugin do Android para Gradle do modelo suporta (AGP 9.4).
 pub const MAX_PLATFORM_API: f32 = 37.0;
 
+/// Menor API em que o app do modelo roda (`minSdk` do projeto gerado).
+pub const MIN_APP_API: u32 = 24;
+
 pub const BASE: &str = "https://dl.google.com/android/repository";
 
 /// Catálogos consultados. Os de imagens de sistema são opcionais: se um falhar,
@@ -118,6 +121,14 @@ impl Catalog {
             .collect();
         v.sort_by_key(|p| p.size);
         v
+    }
+
+    /// A menor imagem em que o app do modelo roda e aparece na tela. As imagens ATD (Automated Test
+    /// Device) iniciam e rodam o app, mas não desenham a interface: a captura sai preta.
+    pub fn recommended_image(&self) -> Option<&Package> {
+        self.images().into_iter().find(|p| {
+            !p.path.contains("_atd") && p.api.as_deref().and_then(|a| a.parse::<u32>().ok()).is_some_and(|a| a >= MIN_APP_API)
+        })
     }
 
     /// A versão estável mais recente de cada tipo de pacote.
@@ -447,6 +458,26 @@ mod tests {
             ],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn recommended_image_is_the_smallest_that_runs_the_template_and_draws_the_screen() {
+        let img = |path: &str, api: &str, mb: u64| Package {
+            api: Some(api.into()),
+            abi: Some("x86".into()),
+            ..pkg(path, Kind::SystemImage, 1, mb << 20)
+        };
+        let c = Catalog {
+            packages: vec![
+                img("system-images;android-10;default;x86", "10", 72),
+                img("system-images;android-30;google_atd;x86", "30", 476),
+                img("system-images;android-24;default;x86", "24", 299),
+                img("system-images;android-31;default;x86", "31", 600),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(c.recommended_image().unwrap().path, "system-images;android-24;default;x86");
+        assert_eq!(c.images()[0].path, "system-images;android-10;default;x86", "a menor de todas continua sendo a API 10");
     }
 
     #[test]

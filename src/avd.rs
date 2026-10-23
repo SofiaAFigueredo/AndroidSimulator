@@ -123,6 +123,14 @@ pub fn serial(port: u16) -> String {
 pub struct Launch {
     pub headless: bool,
     pub port: u16,
+    /// Modo de renderização usado sem janela (`swiftshader_indirect`, `guest`, `angle_indirect`…).
+    pub gpu: String,
+}
+
+impl Launch {
+    pub fn new(headless: bool, port: u16) -> Self {
+        Self { headless, port, gpu: "swiftshader_indirect".into() }
+    }
 }
 
 pub fn launch(root: &Path, name: &str, opts: &Launch) -> Result<Child, String> {
@@ -135,7 +143,7 @@ pub fn launch(root: &Path, name: &str, opts: &Launch) -> Result<Child, String> {
     let mut cmd = Command::new(emu);
     cmd.args(["-avd", name, "-port", &opts.port.to_string(), "-no-snapshot", "-no-audio", "-no-boot-anim"]);
     if opts.headless {
-        cmd.args(["-no-window", "-gpu", "swiftshader_indirect"]);
+        cmd.args(["-no-window", "-gpu", &opts.gpu]);
     }
     isolated(&mut cmd, root);
     cmd.stdin(Stdio::null())
@@ -159,7 +167,67 @@ pub fn adb(root: &Path, args: &[&str]) -> Result<String, String> {
         cmd.creation_flags(0x0800_0000);
     }
     let out = cmd.output().map_err(|e| e.to_string())?;
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if out.status.success() {
+        Ok(stdout)
+    } else {
+        Err(format!("{stdout} {}", String::from_utf8_lossy(&out.stderr).trim()).trim().to_owned())
+    }
+}
+
+/// Captura a tela do emulador como PNG (`adb exec-out screencap -p`).
+pub fn screenshot(root: &Path, port: u16, out: &Path) -> Result<(), String> {
+    let mut cmd = Command::new(adb_path(root));
+    cmd.args(["-s", &serial(port), "exec-out", "screencap", "-p"]);
+    isolated(&mut cmd, root);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let o = cmd.output().map_err(|e| e.to_string())?;
+    if !o.status.success() || !o.stdout.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return Err(format!("screencap falhou: {}", String::from_utf8_lossy(&o.stderr).trim()));
+    }
+    fs::write(out, o.stdout).map_err(|e| e.to_string())
+}
+
+pub fn is_booted(root: &Path, port: u16) -> bool {
+    adb(root, &["-s", &serial(port), "shell", "getprop", "sys.boot_completed"]).is_ok_and(|o| o == "1")
+}
+
+/// Instala o APK e abre o app. Falha com uma mensagem clara se o emulador ainda não terminou o boot.
+pub fn run_apk(root: &Path, port: u16, apk: &Path, package: &str, on_line: &mut dyn FnMut(&str)) -> Result<(), String> {
+    let serial = serial(port);
+    if !is_booted(root, port) {
+        return Err(format!("o emulador {serial} ainda não terminou de iniciar (ou não está rodando)"));
+    }
+    // Em emulador sem janela a tela costuma estar apagada, e o app abriria "no escuro".
+    let _ = adb(root, &["-s", &serial, "shell", "input", "keyevent", "KEYCODE_WAKEUP"]);
+    on_line(&format!("Instalando {} em {serial}…", apk.display()));
+    let out = adb(root, &["-s", &serial, "install", "-r", &apk.to_string_lossy()])?;
+    if !out.contains("Success") {
+        return Err(format!("a instalação falhou: {out}"));
+    }
+    on_line(&format!("Abrindo {package}…"));
+    let out = adb(root, &["-s", &serial, "shell", "monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1"])?;
+    if out.contains("No activities found") || out.contains("monkey aborted") {
+        return Err(format!("não consegui abrir {package}: {out}"));
+    }
+    on_line(&format!("{package} aberto."));
+    Ok(())
+}
+
+/// Janela em foco (`mCurrentFocus`), para diagnosticar se o app chegou à tela.
+#[cfg(test)]
+pub fn focused_window(root: &Path, port: u16) -> String {
+    adb(root, &["-s", &serial(port), "shell", "dumpsys window | grep -E 'mCurrentFocus|mFocusedApp'"]).unwrap_or_default()
+}
+
+/// Confere se o app está em execução: `pidof` devolve o PID.
+#[cfg(test)]
+pub fn app_pid(root: &Path, port: u16, package: &str) -> Option<String> {
+    adb(root, &["-s", &serial(port), "shell", "pidof", package]).ok().filter(|p| !p.is_empty())
 }
 
 #[allow(dead_code)] // usada pelo teste de boot; a UI ainda não mostra o progresso do boot
@@ -247,7 +315,7 @@ mod tests {
             let name = format!("probe_{}", default_name(img));
             create(&root, &name, img).unwrap();
             let port = 5580;
-            let mut child = launch(&root, &name, &Launch { headless: true, port }).unwrap();
+            let mut child = launch(&root, &name, &Launch::new(true, port)).unwrap();
             let r = wait_boot(&root, &mut child, port, Duration::from_secs(240));
             let sdk = adb(&root, &["-s", &serial(port), "shell", "getprop", "ro.build.version.sdk"]).unwrap_or_default();
             println!("RESULTADO {path}: {r:?} (ro.build.version.sdk={sdk})");

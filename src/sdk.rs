@@ -152,6 +152,150 @@ pub fn ensure_metadata(root: &Path, catalog: &crate::catalog::Catalog) {
     }
 }
 
+/// Arquivos a partir deste tamanho são gravados como esparsos.
+const SPARSE_MIN: u64 = 1 << 20;
+const BLOCK: usize = 64 * 1024;
+
+#[cfg(windows)]
+fn mark_sparse(f: &File) {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+    unsafe extern "system" {
+        fn DeviceIoControl(
+            h: *mut c_void,
+            code: u32,
+            input: *const c_void,
+            input_len: u32,
+            output: *mut c_void,
+            output_len: u32,
+            returned: *mut u32,
+            overlapped: *mut c_void,
+        ) -> i32;
+    }
+    const FSCTL_SET_SPARSE: u32 = 0x0009_00C4;
+    let mut returned = 0u32;
+    // Se o sistema de arquivos não suporta (FAT), a chamada falha e o arquivo sai inteiro, só maior.
+    unsafe {
+        DeviceIoControl(
+            f.as_raw_handle(),
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn mark_sparse(_: &File) {}
+
+fn read_full(r: &mut dyn Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match r.read(&mut buf[n..])? {
+            0 => break,
+            k => n += k,
+        }
+    }
+    Ok(n)
+}
+
+/// Copia `r` para `f` pulando os blocos só de zeros, que viram buracos no arquivo. As imagens do
+/// Android são em grande parte zeros (a API 30 baixa 614 MB e vira 3 GB; a API 10 gera 2 GB de
+/// `userdata.img` quase vazio), então isso devolve vários GB de disco.
+pub fn write_sparse(r: &mut dyn Read, f: &mut File) -> std::io::Result<u64> {
+    use std::io::{Seek, SeekFrom};
+    mark_sparse(f);
+    let mut buf = vec![0u8; BLOCK];
+    let mut total = 0u64;
+    loop {
+        let n = read_full(r, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if buf[..n].iter().all(|b| *b == 0) {
+            f.seek(SeekFrom::Current(n as i64))?;
+        } else {
+            f.write_all(&buf[..n])?;
+        }
+        total += n as u64;
+        if n < BLOCK {
+            break;
+        }
+    }
+    f.set_len(total)?;
+    Ok(total)
+}
+
+/// Espaço realmente alocado em disco (menor que o tamanho lógico em arquivos esparsos).
+pub fn allocated_size(path: &Path) -> std::io::Result<u64> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        unsafe extern "system" {
+            fn GetCompressedFileSizeW(name: *const u16, high: *mut u32) -> u32;
+        }
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut high = 0u32;
+        let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
+        if low == u32::MAX && std::io::Error::last_os_error().raw_os_error() != Some(0) {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(((high as u64) << 32) | low as u64)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(fs::metadata(path)?.blocks() * 512)
+    }
+}
+
+/// Regrava um arquivo já extraído como esparso. Devolve `(antes, depois)` em bytes alocados; só
+/// substitui o original quando de fato ocupa menos.
+pub fn compact_file(path: &Path) -> std::io::Result<(u64, u64)> {
+    let before = allocated_size(path)?;
+    let tmp = path.with_extension("compacting");
+    let mut src = File::open(path)?;
+    let mut dst = File::create(&tmp)?;
+    write_sparse(&mut src, &mut dst)?;
+    drop((src, dst));
+    if allocated_size(&tmp)? < before {
+        fs::rename(&tmp, path)?;
+        // Mede de novo já no destino: o número do arquivo temporário não é o que fica em disco.
+        Ok((before, allocated_size(path)?))
+    } else {
+        fs::remove_file(&tmp)?;
+        Ok((before, before))
+    }
+}
+
+/// Compacta as imagens de sistema já instaladas. Devolve quantos bytes foram liberados.
+pub fn compact_installed(root: &Path, on_line: &mut dyn FnMut(&str)) -> u64 {
+    let mut saved = 0;
+    let mut stack = vec![root.join("system-images")];
+    while let Some(dir) = stack.pop() {
+        for e in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if e.metadata().is_ok_and(|m| m.len() >= SPARSE_MIN) {
+                match compact_file(&p) {
+                    Ok((b, a)) if a < b => {
+                        saved += b - a;
+                        on_line(&format!("{}: {} MB liberados", p.file_name().unwrap_or_default().to_string_lossy(), (b - a) >> 20));
+                    }
+                    Ok(_) => {}
+                    Err(e) => on_line(&format!("{}: {e}", p.display())),
+                }
+            }
+        }
+    }
+    saved
+}
+
 /// A pasta raiz comum a todas as entradas, se houver exatamente uma.
 fn common_root(zip: &mut zip::ZipArchive<File>) -> Option<PathBuf> {
     let mut root: Option<PathBuf> = None;
@@ -193,7 +337,11 @@ fn extract(zip_path: &Path, dest: &Path) -> Result<(), String> {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let mut f = File::create(&target).map_err(|e| e.to_string())?;
-        std::io::copy(&mut entry, &mut f).map_err(|e| e.to_string())?;
+        if entry.size() >= SPARSE_MIN {
+            write_sparse(&mut entry, &mut f).map_err(|e| e.to_string())?;
+        } else {
+            std::io::copy(&mut entry, &mut f).map_err(|e| e.to_string())?;
+        }
         #[cfg(unix)]
         if let Some(mode) = entry.unix_mode() {
             use std::os::unix::fs::PermissionsExt;
@@ -208,6 +356,38 @@ mod tests {
     use super::*;
 
     /// Baixa o platform-tools de verdade (≈8 MB). Rode com `cargo test -- --ignored`.
+    #[test]
+    fn sparse_copy_keeps_the_bytes_and_frees_the_zero_blocks() {
+        let mut data = vec![7u8; 1 << 20];
+        data.extend(vec![0u8; 6 << 20]);
+        data.extend((0..(1 << 20)).map(|i| (i % 251) as u8 + 1));
+        data.extend(vec![0u8; 10]); // cauda de zeros que não fecha um bloco
+        let path = std::env::temp_dir().join(format!("andsim-sparse-{}", std::process::id()));
+        let mut f = File::create(&path).unwrap();
+        let n = write_sparse(&mut &data[..], &mut f).unwrap();
+        drop(f);
+        assert_eq!(n, data.len() as u64);
+        assert_eq!(fs::read(&path).unwrap(), data, "o conteúdo precisa ser idêntico");
+        let allocated = allocated_size(&path).unwrap();
+        assert!(allocated < (data.len() as u64) / 2, "alocado {allocated} de {}", data.len());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn compact_file_reports_what_is_really_left_on_disk() {
+        let path = std::env::temp_dir().join(format!("andsim-compact-{}", std::process::id()));
+        let mut data = vec![0u8; 8 << 20];
+        data[..4096].fill(9);
+        fs::write(&path, &data).unwrap();
+        let (before, after) = compact_file(&path).unwrap();
+        assert!(after < before, "{before} -> {after}");
+        assert_eq!(after, allocated_size(&path).unwrap(), "o relatório precisa bater com o disco");
+        assert_eq!(fs::read(&path).unwrap(), data);
+        assert_eq!(compact_file(&path).unwrap().0, compact_file(&path).unwrap().1, "segunda passada não muda nada");
+        assert!(!path.with_extension("compacting").exists());
+        let _ = fs::remove_file(path);
+    }
+
     #[test]
     #[ignore = "usa a rede"]
     fn installs_platform_tools_end_to_end() {
@@ -250,5 +430,34 @@ mod tests {
             .expect("install");
             println!("instalado {path}");
         }
+    }
+
+    /// Compacta as imagens realmente instaladas no SDK do app e mostra o espaço liberado.
+    /// Feche os emuladores antes. `cargo test compacts_installed_images -- --ignored --nocapture`
+    #[test]
+    #[ignore = "regrava as imagens instaladas"]
+    fn compacts_installed_images() {
+        let root = default_root();
+        let used = |dir: &Path| -> u64 {
+            let mut total = 0;
+            let mut stack = vec![dir.to_path_buf()];
+            while let Some(d) = stack.pop() {
+                for e in fs::read_dir(&d).into_iter().flatten().flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else {
+                        total += allocated_size(&p).unwrap_or(0);
+                    }
+                }
+            }
+            total
+        };
+        let images = root.join("system-images");
+        let before = used(&images);
+        let saved = compact_installed(&root, &mut |l| println!("  {l}"));
+        let after = used(&images);
+        println!("system-images: {} MB -> {} MB (liberados {} MB)", before >> 20, after >> 20, saved >> 20);
+        assert_eq!(before - after, saved);
     }
 }

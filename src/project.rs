@@ -1,6 +1,7 @@
 //! Modelo de projeto Android (Kotlin, sem dependências do AndroidX, para o primeiro build
 //! baixar o mínimo) e a compilação dele com o Gradle e o JDK do SDK do app.
 
+use crate::catalog::MIN_APP_API;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -71,7 +72,7 @@ pub fn create(dir: &Path, p: &NewProject) -> Result<(), String> {
     write(&dir.join("app/build.gradle.kts"), &format!(
         "plugins {{\n    id(\"com.android.application\")\n}}\n\n\
          android {{\n    namespace = \"{pkg}\"\n    compileSdk = {cs}\n    buildToolsVersion = \"{}\"\n\n\
-         \x20   defaultConfig {{\n        applicationId = \"{pkg}\"\n        minSdk = 24\n        targetSdk = {cs}\n        versionCode = 1\n        versionName = \"1.0\"\n    }}\n}}\n",
+         \x20   defaultConfig {{\n        applicationId = \"{pkg}\"\n        minSdk = {MIN_APP_API}\n        targetSdk = {cs}\n        versionCode = 1\n        versionName = \"1.0\"\n    }}\n}}\n",
         p.build_tools
     ))?;
     write(&dir.join("app/src/main/AndroidManifest.xml"), &format!(
@@ -161,6 +162,15 @@ pub fn build(root: &Path, project: &Path, task: &str, on_line: &mut dyn FnMut(&s
     Ok(find_apk(project))
 }
 
+/// `applicationId` do módulo `app`, para saber qual pacote abrir depois de instalar.
+pub fn application_id(project: &Path) -> Option<String> {
+    let gradle = fs::read_to_string(project.join("app/build.gradle.kts")).ok()?;
+    let rest = gradle.split("applicationId").nth(1)?;
+    let start = rest.find('"')? + 1;
+    let end = start + rest[start..].find('"')?;
+    Some(rest[start..end].to_owned())
+}
+
 pub fn find_apk(project: &Path) -> Option<PathBuf> {
     let dir = project.join("app/build/outputs/apk/debug");
     fs::read_dir(dir)
@@ -215,12 +225,33 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_application_id_back() {
+        let dir = tmp("appid");
+        let sdk = tmp("sdk3");
+        let p = NewProject { name: "X", package: "com.exemplo.app", compile_sdk: 37, build_tools: "37.0.0", sdk_root: &sdk };
+        create(&dir, &p).unwrap();
+        assert_eq!(application_id(&dir).as_deref(), Some("com.exemplo.app"));
+        assert_eq!(application_id(&tmp("nao-existe")), None);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn rejects_bad_input() {
         let sdk = tmp("sdk2");
         let bad = NewProject { name: "x", package: "Errado", compile_sdk: 37, build_tools: "37.0.0", sdk_root: &sdk };
         assert!(create(&tmp("p2"), &bad).is_err());
         let empty = NewProject { name: "  ", package: "com.a.b", compile_sdk: 37, build_tools: "37.0.0", sdk_root: &sdk };
         assert!(create(&tmp("p3"), &empty).is_err());
+    }
+
+    /// Gera o projeto de exemplo numa pasta temporária, com as versões de `needed` (plataforma e build-tools).
+    fn sample_project(root: &Path, needed: &[&crate::catalog::Package], tag: &str) -> PathBuf {
+        let api = crate::catalog::platform_api(&needed[0].path).expect("API da plataforma");
+        let bt = needed[1].path.split(';').nth(1).unwrap().to_owned();
+        let dir = std::env::temp_dir().join(format!("{tag}-{}", std::process::id()));
+        let p = NewProject { name: "Teste App", package: "com.exemplo.teste", compile_sdk: api, build_tools: &bt, sdk_root: root };
+        create(&dir, &p).expect("create");
+        dir
     }
 
     /// Compila um projeto novo de ponta a ponta no SDK do app: baixa plataforma, build-tools, JDK e
@@ -250,11 +281,7 @@ mod tests {
             println!("baixando {} ({} MB)", pkg.name, pkg.size >> 20);
             crate::sdk::install(&root, pkg, &mut |_| {}).expect("install");
         }
-        let api = crate::catalog::platform_api(&needed[0].path).expect("API da plataforma");
-        let bt = needed[1].path.split(';').nth(1).unwrap().to_owned();
-        let dir = std::env::temp_dir().join(format!("andsim-build-{}", std::process::id()));
-        let p = NewProject { name: "Teste App", package: "com.exemplo.teste", compile_sdk: api, build_tools: &bt, sdk_root: &root };
-        create(&dir, &p).expect("create");
+        let dir = sample_project(&root, &needed, "andsim-build");
         let mut lines = 0;
         let apk = build(&root, &dir, "assembleDebug", &mut |l| {
             lines += 1;
@@ -268,5 +295,81 @@ mod tests {
         let mut zip = zip::ZipArchive::new(fs::File::open(&apk).unwrap()).unwrap();
         assert!(zip.by_name("classes.dex").is_ok() && zip.by_name("AndroidManifest.xml").is_ok());
         println!("PROJETO: {}", dir.display());
+    }
+
+    /// Compila o projeto, sobe o emulador sem janela, instala o APK, abre o app, confere o processo
+    /// e salva uma captura de tela em `ANDSIM_SHOT` (ou na pasta temporária). Exige a imagem
+    /// `ANDSIM_IMAGE` (padrão: API 30 ATD x86_64) já instalada.
+    #[test]
+    #[ignore = "compila e sobe o emulador (alguns minutos)"]
+    fn runs_the_app_on_the_emulator() {
+        use crate::avd;
+        use crate::catalog::Kind;
+        let root = crate::sdk::default_root();
+        let (cat, _) = crate::catalog::fetch_all();
+        crate::sdk::ensure_metadata(&root, &cat);
+        let image = std::env::var("ANDSIM_IMAGE").unwrap_or_else(|_| "system-images;android-30;google_atd;x86_64".into());
+        assert!(crate::sdk::installed(&root).contains_key(&image), "{image} não instalada");
+        let img = cat.packages.iter().find(|p| p.path == image).expect("imagem fora do catálogo");
+        let needed = [cat.latest(Kind::Platform).unwrap(), cat.latest(Kind::BuildTools).unwrap()];
+        let dir = sample_project(&root, &needed, "andsim-run");
+        let apk = build(&root, &dir, "assembleDebug", &mut |_| {}).expect("build").expect("sem APK");
+        let package = application_id(&dir).expect("applicationId");
+
+        let name = format!("probe_run_{}", avd::default_name(img));
+        avd::create(&root, &name, img).unwrap();
+        let port = 5584;
+        let mut child = avd::launch(&root, &name, &avd::Launch { gpu: std::env::var("ANDSIM_GPU").unwrap_or_else(|_| "swiftshader_indirect".into()), ..avd::Launch::new(true, port) }).unwrap();
+        let result = (|| -> Result<(String, std::path::PathBuf), String> {
+            let t = avd::wait_boot(&root, &mut child, port, std::time::Duration::from_secs(420))?;
+            println!("boot em {}s", t.as_secs());
+            avd::run_apk(&root, port, &apk, &package, &mut |l| println!("run> {l}"))?;
+            std::thread::sleep(std::time::Duration::from_secs(8));
+            println!("foco: {}", avd::focused_window(&root, port));
+            let pid = avd::app_pid(&root, port, &package).ok_or("o app não está em execução")?;
+            let shot = std::env::var("ANDSIM_SHOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| std::env::temp_dir().join("andsim-app.png"));
+            avd::screenshot(&root, port, &shot)?;
+            Ok((pid, shot))
+        })();
+        avd::stop(&root, &mut child, port);
+        let _ = avd::delete(&root, &name);
+        let _ = fs::remove_dir_all(&dir);
+        let (pid, shot) = result.expect("rodar o app");
+        println!("RESULTADO: {package} em execução (pid {pid}); captura em {}", shot.display());
+    }
+
+    /// Estraga o Kotlin de propósito e confere que o analisador acha o arquivo e a linha certos na
+    /// saída real do Gradle. `cargo test real_gradle_error_is_clickable -- --ignored --nocapture`
+    #[test]
+    #[ignore = "compila (cerca de 1 min)"]
+    fn real_gradle_error_is_clickable() {
+        use crate::catalog::Kind;
+        let root = crate::sdk::default_root();
+        let (cat, _) = crate::catalog::fetch_all();
+        crate::sdk::ensure_metadata(&root, &cat);
+        let needed = [cat.latest(Kind::Platform).unwrap(), cat.latest(Kind::BuildTools).unwrap()];
+        let dir = sample_project(&root, &needed, "andsim-err");
+        let file = dir.join("app/src/main/java/com/exemplo/teste/MainActivity.kt");
+        let mut src = fs::read_to_string(&file).unwrap();
+        src = src.replace("texto.textSize = 24f", "texto.textSize = naoExiste");
+        fs::write(&file, &src).unwrap();
+        let bad_line = src.lines().position(|l| l.contains("naoExiste")).unwrap() as u32 + 1;
+
+        let mut found = Vec::new();
+        let r = build(&root, &dir, "assembleDebug", &mut |l| {
+            if let Some(d) = crate::diagnostics::parse_line(l) {
+                println!("diagnostico> {d:?}");
+                found.push(d);
+            }
+        });
+        assert!(r.is_err(), "o build deveria falhar");
+        let d = found.iter().find(|d| d.error).expect("nenhum erro reconhecido na saída real do Gradle");
+        assert!(d.path.ends_with("MainActivity.kt") || d.path.to_string_lossy().ends_with("MainActivity.kt"), "{d:?}");
+        assert_eq!(d.line, bad_line, "{d:?}");
+        assert!(d.path.is_file(), "o caminho precisa existir para o painel abrir: {d:?}");
+        println!("OK: erro em {}:{} -> {}", d.path.display(), d.line, d.message);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

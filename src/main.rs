@@ -3,6 +3,7 @@
 mod app;
 mod avd;
 mod catalog;
+mod diagnostics;
 mod highlight;
 mod project;
 mod sdk;

@@ -2,6 +2,7 @@
 //! painel inferior e barra de status.
 
 use crate::avd;
+use crate::diagnostics;
 use crate::catalog::{self, Catalog, Package, Profile};
 use crate::highlight;
 use crate::project;
@@ -32,11 +33,18 @@ struct Tab {
     path: PathBuf,
     text: String,
     dirty: bool,
+    /// Linha para onde rolar na próxima vez que o editor for desenhado.
+    goto: Option<u32>,
 }
 
 enum BuildMsg {
     Line(String),
     Done(Result<Option<PathBuf>, String>),
+}
+
+enum RunMsg {
+    Line(String),
+    Done(Result<(), String>),
 }
 
 struct Job {
@@ -68,6 +76,7 @@ pub struct App {
     running: Vec<(String, u16, std::process::Child)>,
     new_project: Option<(String, String)>,
     build_rx: Option<Receiver<BuildMsg>>,
+    run_rx: Option<Receiver<RunMsg>>,
     last_apk: Option<PathBuf>,
     log: Vec<String>,
 }
@@ -112,6 +121,7 @@ impl App {
             running: Vec::new(),
             new_project: None,
             build_rx: None,
+            run_rx: None,
             last_apk: None,
             log: vec!["Lendo o catálogo oficial do Google…".into()],
         };
@@ -132,7 +142,7 @@ impl App {
             ));
             self.log.extend(warnings.into_iter().map(|w| format!("Aviso: {w}")));
             sdk::ensure_metadata(&self.sdk_root, &cat);
-            self.selected_image = cat.images().first().map(|p| p.path.clone());
+            self.selected_image = cat.recommended_image().or(cat.images().first().copied()).map(|p| p.path.clone());
             self.catalog = cat;
             self.catalog_rx = None;
         }
@@ -155,6 +165,21 @@ impl App {
                 }
                 Ok(None) => self.log.push("Build concluído, mas não achei o APK.".into()),
                 Err(e) => self.log.push(format!("Erro no build: {e}")),
+            }
+        }
+        let mut run_done = None;
+        if let Some(rx) = &self.run_rx {
+            while let Ok(m) = rx.try_recv() {
+                match m {
+                    RunMsg::Line(l) => self.log.push(l),
+                    RunMsg::Done(r) => run_done = Some(r),
+                }
+            }
+        }
+        if let Some(r) = run_done {
+            self.run_rx = None;
+            if let Err(e) = r {
+                self.log.push(format!("Não consegui executar: {e}"));
             }
         }
         if self.log.len() > 5000 {
@@ -226,6 +251,13 @@ impl App {
         }
     }
 
+    fn open_file_at(&mut self, path: &Path, line: u32) {
+        self.open_file(path);
+        if let Some(t) = self.tabs.iter_mut().find(|t| t.path == path) {
+            t.goto = Some(line);
+        }
+    }
+
     fn open_file(&mut self, path: &Path) {
         if let Some(i) = self.tabs.iter().position(|t| t.path == path) {
             self.active = i;
@@ -238,7 +270,7 @@ impl App {
         }
         match std::fs::read_to_string(path) {
             Ok(text) => {
-                self.tabs.push(Tab { path: path.to_owned(), text, dirty: false });
+                self.tabs.push(Tab { path: path.to_owned(), text, dirty: false, goto: None });
                 self.active = self.tabs.len() - 1;
             }
             Err(e) => self.log.push(format!("Não abri {}: {e}", path.display())),
@@ -314,6 +346,24 @@ impl App {
             if ui.add_enabled(can_build, egui::Button::new("Compilar")).on_disabled_hover_text(hint).clicked() {
                 self.compile(ui.ctx());
             }
+            let run_hint = if self.last_apk.is_none() {
+                "Compile o projeto antes"
+            } else if self.running.is_empty() {
+                "Inicie um emulador na aba Dispositivos"
+            } else {
+                "Instalando…"
+            };
+            let can_run = self.last_apk.is_some() && !self.running.is_empty() && self.run_rx.is_none();
+            if ui.add_enabled(can_run, egui::Button::new("Executar")).on_disabled_hover_text(run_hint).clicked() {
+                self.run_app(ui.ctx());
+            }
+            if ui
+                .add_enabled(!self.running.is_empty() && self.run_rx.is_none(), egui::Button::new("Captura"))
+                .on_hover_text("Salva a tela do emulador como captura-AAAAMMDD-HHMMSS.png na pasta do projeto")
+                .clicked()
+            {
+                self.screenshot(ui.ctx());
+            }
         });
         if let Some(apk) = &self.last_apk {
             ui.label(RichText::new(format!("APK: {}", apk.display())).small().color(MUTED));
@@ -363,7 +413,7 @@ impl App {
         );
         ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("Filtrar imagens (API, tipo, ABI)"));
         let filter = self.filter.to_lowercase();
-        let smallest = self.catalog.images().first().map(|p| p.path.clone());
+        let recommended = self.catalog.recommended_image().map(|p| p.path.clone());
         let mut clicked = None;
         let mut remove = None;
         let list_height = (ui.available_height() - 340.0).max(120.0);
@@ -384,8 +434,10 @@ impl App {
                     if ui.selectable_label(on, &label).clicked() {
                         clicked = Some(p.path.clone());
                     }
-                    if smallest.as_deref() == Some(p.path.as_str()) {
-                        ui.label(RichText::new("menor").small().color(ACCENT));
+                    if recommended.as_deref() == Some(p.path.as_str()) {
+                        ui.label(RichText::new("recomendada").small().color(ACCENT)).on_hover_text(
+                            "A menor imagem em que o app do modelo roda e aparece na tela",
+                        );
                     }
                     if self.installed.contains_key(&p.path) {
                         ui.label(RichText::new("instalado").small().color(Color32::LIGHT_GREEN));
@@ -475,13 +527,22 @@ impl App {
         }
         if let Some(name) = start {
             let port = 5554 + 2 * self.running.len() as u16;
-            match avd::launch(&self.sdk_root, &name, &avd::Launch { headless: false, port }) {
+            match avd::launch(&self.sdk_root, &name, &avd::Launch::new(false, port)) {
                 Ok(child) => {
                     self.log.push(format!("Iniciando {name} (console {port})."));
                     self.running.push((name, port, child));
                 }
                 Err(e) => self.log.push(format!("Não iniciei {name}: {e}")),
             }
+        }
+        let idle = self.running.is_empty() && self.run_rx.is_none();
+        if ui
+            .add_enabled(idle, egui::Button::new("Compactar imagens"))
+            .on_hover_text("Regrava as imagens instaladas como arquivos esparsos, sem os blocos de zeros (feche os emuladores antes)")
+            .on_disabled_hover_text("Feche os emuladores e espere a tarefa atual terminar")
+            .clicked()
+        {
+            self.compact(ui.ctx());
         }
         if let Some(name) = stop
             && let Some(i) = self.running.iter().position(|(n, _, _)| *n == name)
@@ -534,6 +595,59 @@ impl App {
                 ctx.request_repaint();
             });
             let _ = tx.send(BuildMsg::Done(r));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Instala o APK compilado no primeiro emulador em execução e abre o app.
+    fn run_app(&mut self, ctx: &egui::Context) {
+        let (Some(apk), Some(&(_, port, _))) = (self.last_apk.clone(), self.running.first()) else { return };
+        let Some(package) = project::application_id(&self.folder) else {
+            self.log.push("Não achei o applicationId em app/build.gradle.kts.".into());
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        let (root, ctx) = (self.sdk_root.clone(), ctx.clone());
+        self.run_rx = Some(rx);
+        std::thread::spawn(move || {
+            let r = avd::run_apk(&root, port, &apk, &package, &mut |l| {
+                let _ = tx.send(RunMsg::Line(l.to_owned()));
+                ctx.request_repaint();
+            });
+            let _ = tx.send(RunMsg::Done(r));
+            ctx.request_repaint();
+        });
+    }
+
+    fn compact(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = mpsc::channel();
+        let (root, ctx) = (self.sdk_root.clone(), ctx.clone());
+        self.log.push("Compactando as imagens instaladas…".into());
+        self.run_rx = Some(rx);
+        std::thread::spawn(move || {
+            let saved = sdk::compact_installed(&root, &mut |l| {
+                let _ = tx.send(RunMsg::Line(l.to_owned()));
+                ctx.request_repaint();
+            });
+            let _ = tx.send(RunMsg::Line(format!("Compactação concluída: {} MB liberados.", saved >> 20)));
+            let _ = tx.send(RunMsg::Done(Ok(())));
+            ctx.request_repaint();
+        });
+    }
+
+    fn screenshot(&mut self, ctx: &egui::Context) {
+        let Some(&(_, port, _)) = self.running.first() else { return };
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let out = self.folder.join(format!("captura-{secs}.png"));
+        let (tx, rx) = mpsc::channel();
+        let (root, ctx) = (self.sdk_root.clone(), ctx.clone());
+        self.run_rx = Some(rx);
+        std::thread::spawn(move || {
+            let r = avd::screenshot(&root, port, &out);
+            if r.is_ok() {
+                let _ = tx.send(RunMsg::Line(format!("Captura salva em {}", out.display())));
+            }
+            let _ = tx.send(RunMsg::Done(r));
             ctx.request_repaint();
         });
     }
@@ -678,7 +792,12 @@ impl App {
             let width = lines.to_string().len();
             let gutter = (1..=lines).map(|n| format!("{n:>width$}")).collect::<Vec<_>>().join("\n");
             let rows = (ui.available_height() / 18.0) as usize;
-            egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+            let row = ui.painter().layout_no_wrap("A".into(), font.clone(), Color32::WHITE).size().y;
+            let mut area = egui::ScrollArea::both().auto_shrink(false);
+            if let Some(line) = t.goto.take() {
+                area = area.vertical_scroll_offset((line.saturating_sub(1) as f32 * row - 120.0).max(0.0));
+            }
+            area.show(ui, |ui| {
                 ui.horizontal_top(|ui| {
                     ui.add(egui::Label::new(RichText::new(gutter).font(font.clone()).color(MUTED)).selectable(false));
                     let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, _wrap: f32| {
@@ -707,6 +826,7 @@ fn flavor(p: &Package) -> &str {
         Some("default") => "AOSP",
         Some("google_apis") => "Google APIs",
         Some("google_apis_playstore") => "Google Play",
+        Some("google_atd") => "ATD (sem tela)",
         Some(other) => other,
         None => "?",
     }
@@ -786,11 +906,32 @@ impl eframe::App for App {
             .frame(egui::Frame::new().fill(BG).inner_margin(8.0))
             .show(ui, |ui| {
                 ui.label(RichText::new("SAÍDA").small().color(MUTED));
-                egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink(false).show(ui, |ui| {
-                    for l in &self.log {
-                        ui.label(RichText::new(l).monospace().small());
-                    }
-                });
+                let mut jump = None;
+                let row = ui.text_style_height(&egui::TextStyle::Small) + 2.0;
+                egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink(false).show_rows(
+                    ui,
+                    row,
+                    self.log.len(),
+                    |ui, range| {
+                        for l in &self.log[range] {
+                            match diagnostics::parse_line(l).filter(|d| d.path.is_file()) {
+                                Some(d) => {
+                                    let color = if d.error { Color32::from_rgb(0xf4, 0x87, 0x71) } else { Color32::from_rgb(0xcc, 0xa7, 0x00) };
+                                    let r = ui.add(egui::Label::new(RichText::new(l).monospace().small().color(color).underline()).sense(egui::Sense::click()));
+                                    if r.on_hover_text("Abrir no editor").clicked() {
+                                        jump = Some(d);
+                                    }
+                                }
+                                None => {
+                                    ui.label(RichText::new(l).monospace().small());
+                                }
+                            }
+                        }
+                    },
+                );
+                if let Some(d) = jump {
+                    self.open_file_at(&d.path, d.line);
+                }
             });
 
         self.activity_bar(ui);
@@ -799,7 +940,7 @@ impl eframe::App for App {
         self.license_window(ctx);
         self.new_project_window(ctx);
 
-        if self.job.is_some() || self.build_rx.is_some() {
+        if self.job.is_some() || self.build_rx.is_some() || self.run_rx.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
     }

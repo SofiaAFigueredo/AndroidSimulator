@@ -29,24 +29,32 @@ Temurin 21, da Adoptium) e o Gradle 9.8.2, com o SHA-256 conferido, para compila
 
 No Explorador, **Novo projeto** gera um app Kotlin (plugin do Android para Gradle 9.4.1, Kotlin embutido,
 sem AndroidX) e **Compilar** roda `gradle assembleDebug` com o JDK, o SDK e o cache do Gradle do próprio
-app, mostrando a saída no painel inferior. Verificado de ponta a ponta: o projeto novo compila em ~1 min
-(depois de baixar o plugin e as dependências) e gera um APK de ~855 KB.
+app, mostrando a saída no painel inferior. **Executar** instala o APK no primeiro emulador em
+execução e abre o app. Verificado de ponta a ponta: o projeto novo compila em ~1 min (depois de baixar
+o plugin e as dependências), gera um APK de ~855 KB e aparece na tela do emulador.
 `cargo test builds_a_new_project -- --ignored --nocapture`
 
 O app grava o `package.xml` de cada pacote instalado, como o sdkmanager faz; sem ele o AGP não reconhece
 a plataforma como instalada.
 
-## Imagem mínima testada
+## Qual imagem escolher
 
-`system-images;android-10;default;x86` (72 MB) inicia no emulador 37.2 com WHPX e chega a
-`sys.boot_completed=1` em cerca de 8 s (Windows 11, sem janela). Teste:
-`ANDSIM_IMAGES="system-images;android-10;default;x86" cargo test boots_images -- --ignored --nocapture`.
-O API 10 é antigo; apps modernos exigem uma imagem mais nova.
+Medido neste computador (Windows 11, WHPX), emulador 37.2:
 
-`system-images;android-30;google_atd;x86_64` (614 MB, ATD: sem tela inicial nem apps do sistema)
-também inicia e reporta `ro.build.version.sdk=30`, mas o primeiro boot a frio, sem janela e sem
-snapshot, levou cerca de 175 s. A menor imagem API 30+ do catálogo é a `android-30;google_atd;x86`
-(476 MB), ainda não testada.
+| Imagem | Download | Boot | Mostra a tela? |
+|---|---|---|---|
+| `android-10;default;x86` | 72 MB | ~8 s | sim, mas o app do modelo exige API 24+ |
+| `android-24;default;x86` | 299 MB | ~14 s | **sim; é a recomendada** (menor que roda o app do modelo) |
+| `android-30;google_atd;x86_64` | 614 MB | 30 a 175 s | **não**: as imagens ATD rodam o app, mas não desenham a interface (a captura sai preta) |
+
+O app marca como "recomendada" a menor imagem com API 24 ou mais que não seja ATD.
+
+## Espaço em disco
+
+As imagens vêm compactadas: baixar 614 MB vira 3 GB, e a API 10 gera um `userdata.img` de 2 GB quase
+todo de zeros. O app extrai arquivos grandes como **esparsos** (os blocos de zeros não ocupam disco) e o
+botão **Compactar imagens** faz o mesmo nas já instaladas. Medido nas três imagens acima:
+`system-images` foi de **6,4 GB para 2,2 GB** em disco, e elas continuam iniciando.
 
 ## Estado atual
 
@@ -54,10 +62,10 @@ snapshot, levou cerca de 175 s. A menor imagem API 30+ do catálogo é a `androi
 - [x] Explorador de arquivos e editor de texto com abas (Ctrl+S salva)
 - [x] Gerenciador de download do emulador com escolha da imagem
 - [x] Syntax highlight (Kotlin, Java, XML) e números de linha
-- [x] Criar, iniciar e parar AVDs (instalar APK ainda não)
+- [x] Criar, iniciar, parar e excluir AVDs
 - [ ] Logcat e terminal
-- [x] Build via Gradle (saída no painel; erros clicáveis ainda não)
-- [ ] Instalar o APK no emulador e abrir o app
+- [x] Build via Gradle, com erros do Kotlin, javac e aapt2 clicáveis no painel de saída
+- [x] Executar: instala o APK no emulador e abre o app; Captura salva a tela do emulador
 - [ ] Autocomplete via LSP
 
 ## Rodar
@@ -65,5 +73,5 @@ snapshot, levou cerca de 175 s. A menor imagem API 30+ do catálogo é a `androi
 ```bash
 cargo run --release
 cargo test
-cargo test -- --ignored   # baixa o platform-tools de verdade
+cargo test -- --ignored   # testes que usam a rede, o Gradle e o emulador (veja os comentários de cada um)
 ```
