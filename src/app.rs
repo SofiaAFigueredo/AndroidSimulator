@@ -1,6 +1,7 @@
 //! Interface no estilo VS Code: barra de atividades, barra lateral, abas de editor,
 //! painel inferior e barra de status.
 
+use crate::avd;
 use crate::catalog::{self, Catalog, Kind, Package};
 use crate::sdk::{self, Event};
 use eframe::egui::{self, Color32, RichText};
@@ -52,6 +53,8 @@ pub struct App {
     folder_input: String,
     tabs: Vec<Tab>,
     active: usize,
+    avds: Vec<String>,
+    running: Vec<(String, u16, std::process::Child)>,
     log: Vec<String>,
 }
 
@@ -67,6 +70,7 @@ impl App {
         });
         let sdk_root = sdk::default_root();
         let folder = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let avds = avd::list(&sdk_root);
         Self {
             view: View::Devices,
             installed: sdk::installed(&sdk_root),
@@ -83,6 +87,8 @@ impl App {
             folder,
             tabs: Vec::new(),
             active: 0,
+            avds,
+            running: Vec::new(),
             log: vec!["Lendo o catálogo oficial do Google…".into()],
         }
     }
@@ -102,6 +108,7 @@ impl App {
             self.catalog_rx = None;
         }
 
+        self.running.retain_mut(|(_, _, c)| c.try_wait().map(|s| s.is_none()).unwrap_or(false));
         let mut finished = None;
         if let Some(job) = &mut self.job {
             while let Ok(ev) = job.rx.try_recv() {
@@ -286,7 +293,7 @@ impl App {
         let smallest = self.catalog.images().first().map(|p| p.path.clone());
         let mut clicked = None;
         let mut remove = None;
-        let list_height = (ui.available_height() - 150.0).max(120.0);
+        let list_height = (ui.available_height() - 290.0).max(120.0);
         egui::ScrollArea::vertical().max_height(list_height).auto_shrink(false).show(ui, |ui| {
             for p in self.catalog.images() {
                 let label = format!(
@@ -328,6 +335,8 @@ impl App {
         }
 
         ui.separator();
+        self.avd_section(ui);
+        ui.separator();
         if let Some(job) = &self.job {
             ui.label(format!("{}: {}", job.name, job.phase));
             let frac = if job.total > 0 { job.done as f32 / job.total as f32 } else { 0.0 };
@@ -344,6 +353,76 @@ impl App {
             if ui.button(format!("Baixar ({})", catalog::human_size(total))).clicked() {
                 self.request_install(plan);
             }
+        }
+    }
+
+    fn avd_section(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("DISPOSITIVOS VIRTUAIS").small().color(MUTED));
+        let ready = self.installed.contains_key("emulator") && self.installed.contains_key("platform-tools");
+        let image = self
+            .selected_image
+            .as_ref()
+            .filter(|p| self.installed.contains_key(*p))
+            .and_then(|path| self.catalog.packages.iter().find(|p| &p.path == path))
+            .cloned();
+        if let Some(img) = &image {
+            let name = avd::default_name(img);
+            if !self.avds.contains(&name) && ui.button(format!("Criar {name}")).clicked() {
+                match avd::create(&self.sdk_root, &name, img) {
+                    Ok(()) => self.log.push(format!("AVD {name} criado.")),
+                    Err(e) => self.log.push(format!("Não criei {name}: {e}")),
+                }
+                self.avds = avd::list(&self.sdk_root);
+            }
+        }
+        let mut start = None;
+        let mut delete = None;
+        let mut stop = None;
+        for name in &self.avds {
+            let running = self.running.iter().any(|(n, _, _)| n == name);
+            ui.horizontal(|ui| {
+                ui.label(name);
+                if running {
+                    ui.label(RichText::new("em execução").small().color(Color32::LIGHT_GREEN));
+                    if ui.small_button("parar").clicked() {
+                        stop = Some(name.clone());
+                    }
+                } else {
+                    if ui.add_enabled(ready, egui::Button::new("Iniciar")).clicked() {
+                        start = Some(name.clone());
+                    }
+                    if ui.small_button("excluir").clicked() {
+                        delete = Some(name.clone());
+                    }
+                }
+            });
+        }
+        if self.avds.is_empty() {
+            ui.label(RichText::new("Nenhum AVD. Instale uma imagem e crie um.").small().color(MUTED));
+        }
+        if let Some(name) = start {
+            let port = 5554 + 2 * self.running.len() as u16;
+            match avd::launch(&self.sdk_root, &name, &avd::Launch { headless: false, port }) {
+                Ok(child) => {
+                    self.log.push(format!("Iniciando {name} (console {port})."));
+                    self.running.push((name, port, child));
+                }
+                Err(e) => self.log.push(format!("Não iniciei {name}: {e}")),
+            }
+        }
+        if let Some(name) = stop
+            && let Some(i) = self.running.iter().position(|(n, _, _)| *n == name)
+        {
+            let (_, port, mut child) = self.running.remove(i);
+            avd::stop(&self.sdk_root, &mut child, port);
+            self.log.push(format!("{name} parado."));
+        }
+        if let Some(name) = delete {
+            match avd::delete(&self.sdk_root, &name) {
+                Ok(()) => self.log.push(format!("AVD {name} excluído.")),
+                Err(e) => self.log.push(format!("Não excluí {name}: {e}")),
+            }
+            self.avds = avd::list(&self.sdk_root);
         }
     }
 
