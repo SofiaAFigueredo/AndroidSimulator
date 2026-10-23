@@ -33,6 +33,10 @@ pub enum Kind {
     Cmake,
     Jdk,
     Gradle,
+    /// Servidor de linguagem Java (autocomplete).
+    JavaLs,
+    /// Servidor de linguagem Kotlin (autocomplete).
+    KotlinLs,
 }
 
 /// Perfil de instalação: o que baixar de uma vez, sempre na versão mais recente.
@@ -41,7 +45,7 @@ pub enum Profile {
     /// Só o necessário para rodar um app: emulador, adb e a imagem escolhida.
     Compact,
     /// Rodar e compilar: a Compacta mais plataforma, build-tools, cmdline-tools,
-    /// código-fonte do Android, NDK e CMake.
+    /// código-fonte do Android, NDK, CMake, JDK, Gradle e os servidores de autocomplete.
     Complete,
 }
 
@@ -60,6 +64,8 @@ impl Profile {
                 Kind::Cmake,
                 Kind::Jdk,
                 Kind::Gradle,
+                Kind::JavaLs,
+                Kind::KotlinLs,
             ],
         }
     }
@@ -149,13 +155,13 @@ impl Catalog {
     }
 
     /// O que baixar para o perfil e a imagem escolhida, sem repetir o que já está instalado.
-    pub fn plan(&self, profile: Profile, image: Option<&str>, installed: &dyn Fn(&str) -> bool) -> Vec<Package> {
+    pub fn plan(&self, profile: Profile, image: Option<&str>, installed: &dyn Fn(&Package) -> bool) -> Vec<Package> {
         let mut v: Vec<Package> = profile
             .kinds()
             .iter()
             .filter_map(|k| self.latest(*k))
             .chain(image.and_then(|path| self.packages.iter().find(|p| p.path == path)))
-            .filter(|p| !installed(&p.path))
+            .filter(|p| !installed(p))
             .cloned()
             .collect();
         v.dedup_by(|a, b| a.path == b.path);
@@ -505,7 +511,7 @@ mod tests {
     #[test]
     fn compact_is_a_subset_of_complete_and_skips_installed() {
         let c = sample();
-        let none = |_: &str| false;
+        let none = |_: &Package| false;
         let compact: Vec<String> = c.plan(Profile::Compact, None, &none).into_iter().map(|p| p.path).collect();
         let complete: Vec<String> = c.plan(Profile::Complete, None, &none).into_iter().map(|p| p.path).collect();
         assert_eq!(compact, ["emulator", "platform-tools"]);
@@ -515,7 +521,7 @@ mod tests {
         assert_eq!(with_image.last().unwrap().path, "platforms;android-34");
         assert!(compact.iter().all(|p| complete.contains(p)));
         assert!(complete.contains(&"ndk;28.0.1".to_string()) && !compact.contains(&"ndk;28.0.1".to_string()));
-        let have = |p: &str| p == "emulator";
+        let have = |p: &Package| p.path == "emulator";
         assert!(!c.plan(Profile::Compact, None, &have).iter().any(|p| p.path == "emulator"));
     }
 }
@@ -532,7 +538,7 @@ mod network_tests {
         assert!(warnings.is_empty(), "{warnings:?}");
         let image = cat.images().first().map(|p| p.path.clone());
         for profile in [Profile::Compact, Profile::Complete] {
-            let plan = cat.plan(profile, image.as_deref(), &|_| false);
+            let plan = cat.plan(profile, image.as_deref(), &|_: &Package| false);
             let total: u64 = plan.iter().map(|p| p.size).sum();
             println!("{profile:?}: {} pacotes, {}", plan.len(), human_size(total));
             for p in &plan {
@@ -540,7 +546,7 @@ mod network_tests {
             }
             assert!(plan.iter().any(|p| p.kind == Kind::Emulator));
         }
-        let complete = cat.plan(Profile::Complete, None, &|_| false);
+        let complete = cat.plan(Profile::Complete, None, &|_: &Package| false);
         assert!(complete.iter().any(|p| p.kind == Kind::Ndk && !p.path.contains("rc")));
         assert!(complete.iter().any(|p| p.kind == Kind::Sources));
     }

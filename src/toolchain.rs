@@ -105,10 +105,66 @@ fn gradle() -> Result<Package, String> {
     })
 }
 
+/// Versão do Eclipse JDT LS usada. A 1.62 em diante exige Java 25 (`JavaSE-25` no bundle), e o JDK do
+/// app é o 21, então esta é a última milestone compatível. Para subir de versão, suba o JDK junto.
+pub const JDTLS_VERSION: &str = "1.61.0";
+
+/// Servidor de linguagem Java: Eclipse JDT LS (EPL-2.0), com o SHA-256 que o Eclipse publica ao lado
+/// do arquivo.
+fn jdtls() -> Result<Package, String> {
+    let base = format!("https://download.eclipse.org/jdtls/milestones/{JDTLS_VERSION}");
+    let name = get(&format!("{base}/latest.txt"))?.trim().to_owned();
+    if !name.starts_with("jdt-language-server-") || !name.ends_with(".tar.gz") || name.contains('/') {
+        return Err(format!("nome de arquivo inesperado em latest.txt: {name:?}"));
+    }
+    let url = format!("{base}/{name}");
+    let checksum = get(&format!("{url}.sha256"))?.split_whitespace().next().unwrap_or_default().to_owned();
+    if checksum.len() != 64 {
+        return Err(format!("checksum do jdtls inválido: {checksum:?}"));
+    }
+    let size = ureq::head(&url).call().ok().and_then(|r| r.headers().get("content-length").and_then(|v| v.to_str().ok()?.parse().ok())).unwrap_or(0);
+    let version: Vec<u32> = name.trim_start_matches("jdt-language-server-").split(['.', '-']).filter_map(|n| n.parse().ok()).collect();
+    Ok(Package {
+        path: "lsp;jdtls".into(),
+        name: "Autocomplete Java (Eclipse JDT LS)".into(),
+        kind: Kind::JavaLs,
+        api: None,
+        abi: None,
+        revision: (*version.first().unwrap_or(&0), *version.get(1).unwrap_or(&0), *version.get(2).unwrap_or(&0)),
+        size,
+        url,
+        checksum,
+        license: String::new(),
+        package_xml: String::new(),
+    })
+}
+
+/// Servidor de linguagem Kotlin (fwcd, MIT). O GitHub não publica hash desse arquivo, então o
+/// SHA-256 fica fixado aqui, medido no download da versão 1.3.13: se o arquivo mudar, o app recusa.
+pub const KOTLIN_LS_VERSION: &str = "1.3.13";
+pub const KOTLIN_LS_SHA256: &str = "4fe7d71d087b307c7869036171bd9d8c6a4284cd7c25b89098b0a24eb2d9b6d2";
+
+fn kotlin_ls() -> Package {
+    Package {
+        path: "lsp;kotlin".into(),
+        name: format!("Autocomplete Kotlin (kotlin-language-server {KOTLIN_LS_VERSION})"),
+        kind: Kind::KotlinLs,
+        api: None,
+        abi: None,
+        revision: (1, 3, 13),
+        size: 87_291_855,
+        url: format!("https://github.com/fwcd/kotlin-language-server/releases/download/{KOTLIN_LS_VERSION}/server.zip"),
+        checksum: KOTLIN_LS_SHA256.into(),
+        license: String::new(),
+        package_xml: String::new(),
+    }
+}
+
 pub fn fetch_packages() -> (Vec<Package>, Vec<String>) {
     let mut pkgs = Vec::new();
     let mut warnings = Vec::new();
-    for (what, r) in [("JDK", jdk()), ("Gradle", gradle())] {
+    pkgs.push(kotlin_ls());
+    for (what, r) in [("JDK", jdk()), ("Gradle", gradle()), ("Autocomplete Java", jdtls())] {
         match r {
             Ok(p) => pkgs.push(p),
             Err(e) => warnings.push(format!("{what}: {e}")),
@@ -131,6 +187,14 @@ mod tests {
         assert_eq!(p.size, 205_520_896);
         assert_eq!(p.name, "Eclipse Temurin jdk-21.0.12.1+1");
         assert_eq!(p.install_dir(), std::path::PathBuf::from("jdk/21"));
+    }
+
+    #[test]
+    fn kotlin_server_is_pinned_by_hash() {
+        let p = kotlin_ls();
+        assert_eq!(p.checksum.len(), 64);
+        assert!(p.url.contains(KOTLIN_LS_VERSION) && p.url.ends_with("server.zip"));
+        assert_eq!(p.install_dir(), std::path::PathBuf::from("lsp/kotlin"));
     }
 
     #[test]

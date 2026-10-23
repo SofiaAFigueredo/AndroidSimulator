@@ -20,7 +20,7 @@ tipo, ABI e tamanho, e baixa só o que o usuário escolher para uma pasta própr
 | Perfil | O que baixa | Tamanho (catálogo de out/2026) |
 |---|---|---|
 | Compacta | emulador, adb e a imagem escolhida: o necessário para **rodar** apps | 514 MB com a imagem de 72 MB |
-| Completa | a Compacta mais plataforma, build-tools, cmdline-tools, fontes do Android, NDK e CMake | 1,5 GB |
+| Completa | a Compacta mais plataforma, build-tools, cmdline-tools, fontes do Android, NDK, CMake, JDK, Gradle e os servidores de autocomplete | cerca de 2,0 GB |
 
 Sempre a versão estável mais recente de cada ferramenta. A Completa também baixa o JDK (Eclipse
 Temurin 21, da Adoptium) e o Gradle 9.8.2, com o SHA-256 conferido, para compilar apps.
@@ -66,7 +66,7 @@ botão **Compactar imagens** faz o mesmo nas já instaladas. Medido nas três im
 - [x] Logcat (filtro por nível e texto) e terminal integrado, em abas no painel inferior
 - [x] Build via Gradle, com erros do Kotlin, javac e aapt2 clicáveis no painel de saída
 - [x] Executar: instala o APK no emulador e abre o app; Captura salva a tela do emulador
-- [ ] Autocomplete via LSP
+- [x] Autocomplete via LSP para Java (jdtls) e Kotlin (kotlin-language-server), com classes do Android
 
 ## Logcat e terminal
 
@@ -79,6 +79,27 @@ O painel inferior tem três abas: **Saída** (downloads, Gradle, emulador), **Lo
   `java` já no PATH e `JAVA_HOME` apontando para o JDK do app. Tem `cd`, `clear`, histórico (↑/↓) e o botão
   Parar. Não é um PTY: programas interativos (vim, REPLs) não funcionam. Não usa nenhuma biblioteca de
   terminal, para o binário continuar pequeno.
+
+## Autocomplete (LSP)
+
+O editor sugere código em Java e Kotlin falando LSP com servidores que o app baixa na Completa
+(só quando há um arquivo da linguagem aberto): **Ctrl+Espaço** ou digitar `.` abre a lista; ↑/↓ escolhem,
+**Enter/Tab** aceitam e **Esc** fecha. Se a sugestão for um snippet (`map { transform }`), o espaço
+reservado fica selecionado para a próxima digitação substituí-lo.
+
+| Linguagem | Servidor | Download | Observação |
+|---|---|---|---|
+| Java | Eclipse JDT LS 1.61.0 (EPL-2.0) | 49 MB | a 1.62+ exige Java 25 e o JDK do app é o 21; SHA-256 conferido |
+| Kotlin | kotlin-language-server 1.3.13 (MIT) | 83 MB | o GitHub não publica hash; o SHA-256 fica fixado no código |
+
+Verificado com os servidores reais, incluindo o editor dirigido por eventos de teclado simulados:
+`System.` → `out`, `lista.ma` → `map`, e `import android.os.Bu` → `Bundle` nas duas linguagens.
+
+Limitações: o servidor Kotlin devolve no máximo 75 itens (o app pede de novo conforme se digita); logo
+depois de abrir um arquivo a primeira resposta pode vir vazia, enquanto o servidor analisa (o app avisa e
+basta repetir o atalho); o import do Gradle é desligado, então o classpath é a `android.jar` mais a
+biblioteca padrão e não as dependências do `build.gradle`; cada servidor é um processo Java (o jdtls
+reserva até 1 GB de memória). Não há diagnósticos (sublinhado de erros) nem ir-para-definição.
 
 ## Rodar
 

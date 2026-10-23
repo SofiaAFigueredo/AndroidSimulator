@@ -78,8 +78,9 @@ pub fn install(root: &Path, pkg: &Package, emit: &mut dyn FnMut(Event)) -> Resul
     let io = |e: std::io::Error| e.to_string();
     let downloads = root.join(".downloads");
     fs::create_dir_all(&downloads).map_err(io)?;
-    let zip_path = downloads.join(format!("{}.zip", pkg.path.replace(';', "_")));
-    let part = zip_path.with_extension("zip.part");
+    let ext = if pkg.url.ends_with(".tar.gz") { "tar.gz" } else { "zip" };
+    let zip_path = downloads.join(format!("{}.{ext}", pkg.path.replace(';', "_")));
+    let part = PathBuf::from(format!("{}.part", zip_path.display()));
 
     emit(Event::Phase(format!("Baixando {}", pkg.name)));
     let resp = ureq::get(&pkg.url).call().map_err(|e| e.to_string())?;
@@ -121,8 +122,16 @@ pub fn install(root: &Path, pkg: &Package, emit: &mut dyn FnMut(Event)) -> Resul
 
     emit(Event::Phase("Extraindo".into()));
     let dest = root.join(pkg.install_dir());
+    // Reinstalação (atualização ou troca de versão): começa de uma pasta limpa, sem restos da versão anterior.
+    if dest.exists() {
+        fs::remove_dir_all(&dest).map_err(io)?;
+    }
     fs::create_dir_all(&dest).map_err(io)?;
-    extract(&zip_path, &dest)?;
+    if ext == "tar.gz" {
+        extract_tar_gz(&zip_path, &dest)?;
+    } else {
+        extract(&zip_path, &dest)?;
+    }
     let _ = fs::remove_file(&zip_path);
 
     write_package_xml(root, pkg).map_err(io)?;
@@ -130,6 +139,28 @@ pub fn install(root: &Path, pkg: &Package, emit: &mut dyn FnMut(Event)) -> Resul
     map.insert(pkg.path.clone(), pkg.revision_text());
     write_installed(root, &map).map_err(io)?;
     Ok(())
+}
+
+/// Extrai um `.tar.gz` com o `tar` do sistema (no Windows, o `tar.exe` que vem com o sistema; o caminho
+/// absoluto evita pegar um GNU tar do Git, que lê `C:\\x` como "máquina C"). Sem dependências extras.
+fn extract_tar_gz(archive: &Path, dest: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    let tar = PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into())).join("System32").join("tar.exe");
+    #[cfg(not(windows))]
+    let tar = PathBuf::from("tar");
+    let mut cmd = std::process::Command::new(tar);
+    cmd.arg("-xzf").arg(archive).arg("-C").arg(dest);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let out = cmd.output().map_err(|e| format!("não consegui rodar o tar: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("o tar falhou: {}", String::from_utf8_lossy(&out.stderr).trim()))
+    }
 }
 
 /// Grava o `package.xml` que o sdkmanager grava; sem ele o AGP não reconhece o pacote instalado.
@@ -357,6 +388,29 @@ mod tests {
 
     /// Baixa o platform-tools de verdade (≈8 MB). Rode com `cargo test -- --ignored`.
     #[test]
+    fn extracts_a_tar_gz_with_the_system_tar() {
+        let base = std::env::temp_dir().join(format!("andsim-tar-{}", std::process::id()));
+        let (src, out) = (base.join("src"), base.join("out"));
+        fs::create_dir_all(src.join("plugins")).unwrap();
+        fs::create_dir_all(&out).unwrap();
+        fs::write(src.join("plugins").join("a.jar"), b"conteudo").unwrap();
+        fs::write(src.join("config.ini"), b"x=1").unwrap();
+        let archive = base.join("pacote.tar.gz");
+        let tar_exe = if cfg!(windows) {
+            PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32").join("tar.exe")
+        } else {
+            PathBuf::from("tar")
+        };
+        let ok = std::process::Command::new(tar_exe).arg("-czf").arg(&archive).arg("-C").arg(&src).arg(".").status().unwrap();
+        assert!(ok.success());
+        extract_tar_gz(&archive, &out).unwrap();
+        assert_eq!(fs::read(out.join("plugins").join("a.jar")).unwrap(), b"conteudo");
+        assert_eq!(fs::read(out.join("config.ini")).unwrap(), b"x=1");
+        assert!(extract_tar_gz(&base.join("nao-existe.tar.gz"), &out).is_err());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn sparse_copy_keeps_the_bytes_and_frees_the_zero_blocks() {
         let mut data = vec![7u8; 1 << 20];
         data.extend(vec![0u8; 6 << 20]);
@@ -414,8 +468,8 @@ mod tests {
         let (cat, _) = crate::catalog::fetch_all();
         for path in wanted.split(',') {
             let pkg = cat.packages.iter().find(|p| p.path == path).unwrap_or_else(|| panic!("{path} fora do catálogo"));
-            assert!(accepted_licenses(&root).contains(&pkg.license), "licença {} não aceita; aceite pelo app", pkg.license);
-            if installed(&root).contains_key(path) {
+            assert!(pkg.license.is_empty() || accepted_licenses(&root).contains(&pkg.license), "licença {} não aceita; aceite pelo app", pkg.license);
+            if installed(&root).get(path) == Some(&pkg.revision_text()) {
                 continue;
             }
             let mut last = 0;

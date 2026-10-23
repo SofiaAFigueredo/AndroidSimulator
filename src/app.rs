@@ -1,13 +1,16 @@
 //! Interface no estilo VS Code: barra de atividades, barra lateral, abas de editor,
 //! painel inferior e barra de status.
 
+use crate::autocomplete::{self, Manager as AutoComplete, Popup};
 use crate::avd;
 use crate::diagnostics;
 use crate::catalog::{self, Catalog, Package, Profile};
 use crate::highlight;
 use crate::logcat::LogcatView;
 use crate::terminal::Terminal;
+use crate::lsp;
 use crate::project;
+use crate::servers;
 use crate::toolchain;
 use crate::sdk::{self, Event};
 use eframe::egui::{self, Color32, RichText};
@@ -44,6 +47,17 @@ struct Tab {
     dirty: bool,
     /// Linha para onde rolar na próxima vez que o editor for desenhado.
     goto: Option<u32>,
+    /// Versão do documento no servidor de linguagem; 0 enquanto não foi aberto lá.
+    lsp_version: i32,
+}
+
+/// Pedido de completion em andamento.
+struct Pending {
+    rx: Receiver<Result<serde_json::Value, String>>,
+    tab: usize,
+    origin: usize,
+    /// Pedido feito com Ctrl+Espaço (e não ao digitar): vale avisar se vier vazio.
+    explicit: bool,
 }
 
 enum BuildMsg {
@@ -83,6 +97,13 @@ pub struct App {
     active: usize,
     avds: Vec<String>,
     running: Vec<(String, u16, std::process::Child)>,
+    ac: AutoComplete,
+    popup: Option<Popup>,
+    pending: Option<Pending>,
+    /// Cursor (índice de caractere) do editor no último quadro.
+    cursor: usize,
+    /// Posição em que o cursor deve ficar no próximo quadro (depois de aceitar uma sugestão).
+    set_cursor: Option<(usize, usize)>,
     bottom: Bottom,
     logcat: LogcatView,
     terminal: Terminal,
@@ -97,8 +118,14 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        apply_theme(&cc.egui_ctx);
-        let ctx = cc.egui_ctx.clone();
+        // `android-simulator [pasta] [arquivo]` abre o projeto direto no Explorador.
+        Self::build(&cc.egui_ctx, std::env::args().skip(1).collect())
+    }
+
+    /// Monta o app a partir de um contexto do egui (sem janela), para os testes poderem criá-lo.
+    fn build(ctx: &egui::Context, args: Vec<String>) -> Self {
+        apply_theme(ctx);
+        let ctx = ctx.clone();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let result = catalog::fetch_all();
@@ -108,8 +135,6 @@ impl App {
         let sdk_root = sdk::default_root();
         let folder = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let avds = avd::list(&sdk_root);
-        // `android-simulator [pasta] [arquivo]` abre o projeto direto no Explorador.
-        let args: Vec<String> = std::env::args().skip(1).collect();
         let (folder, view) = match args.first().map(PathBuf::from).filter(|p| p.is_dir()) {
             Some(dir) => (dir, View::Explorer),
             None => (folder, View::Devices),
@@ -127,6 +152,11 @@ impl App {
             queue: VecDeque::new(),
             job: None,
             pending_license: None,
+            ac: AutoComplete::default(),
+            popup: None,
+            pending: None,
+            cursor: 0,
+            set_cursor: None,
             terminal: Terminal::new(folder.clone()),
             term_folder: folder.clone(),
             bottom: Bottom::Output,
@@ -258,7 +288,9 @@ impl App {
 
     /// Pacotes que faltam para o perfil escolhido, mais a imagem selecionada.
     fn plan(&self) -> Vec<Package> {
-        self.catalog.plan(self.profile, self.selected_image.as_deref(), &|p| self.installed.contains_key(p))
+        self.catalog.plan(self.profile, self.selected_image.as_deref(), &|p| {
+            self.installed.get(&p.path).is_some_and(|rev| *rev == p.revision_text())
+        })
     }
 
     fn request_install(&mut self, pkgs: Vec<Package>) {
@@ -288,7 +320,7 @@ impl App {
         }
         match std::fs::read_to_string(path) {
             Ok(text) => {
-                self.tabs.push(Tab { path: path.to_owned(), text, dirty: false, goto: None });
+                self.tabs.push(Tab { path: path.to_owned(), text, dirty: false, goto: None, lsp_version: 0 });
                 self.active = self.tabs.len() - 1;
             }
             Err(e) => self.log.push(format!("Não abri {}: {e}", path.display())),
@@ -824,7 +856,14 @@ impl App {
         });
         ui.separator();
         if let Some(i) = close {
-            self.tabs.remove(i);
+            let t = self.tabs.remove(i);
+            if t.lsp_version > 0
+                && let Some(c) = self.ac.client(highlight::lang_for(&t.path))
+            {
+                let _ = c.did_close(&lsp::path_to_uri(&t.path));
+            }
+            self.popup = None;
+            self.pending = None;
             self.active = self.active.min(self.tabs.len().saturating_sub(1));
             return;
         }
@@ -840,26 +879,220 @@ impl App {
             if let Some(line) = t.goto.take() {
                 area = area.vertical_scroll_offset((line.saturating_sub(1) as f32 * row - 120.0).max(0.0));
             }
+            let (path_lang, uri) = (highlight::lang_for(&t.path), lsp::path_to_uri(&t.path));
+            let ctx = ui.ctx().clone();
+            let id = egui::Id::unique(("editor", &t.path));
+            let supported = servers::language_id(path_lang).is_some() && t.text.len() <= MAX_HIGHLIGHT_BYTES;
+            let mut changed_text = false;
+
+            // Resposta do servidor a um pedido de completion.
+            if let Some(p) = &self.pending {
+                match p.rx.try_recv() {
+                    Ok(result) => {
+                        let (tab, origin, explicit) = (p.tab, p.origin, p.explicit);
+                        self.pending = None;
+                        match result {
+                            Ok(v) if tab == self.active => {
+                                let items = lsp::parse_completion(&v);
+                                if items.is_empty() && explicit {
+                                    self.log.push("Autocomplete: nenhuma sugestão (o servidor pode ainda estar analisando o projeto; tente de novo).".into());
+                                }
+                                self.popup = (!items.is_empty()).then(|| Popup { items, incomplete: lsp::is_incomplete(&v), selected: 0, origin });
+                            }
+                            Ok(_) => {}
+                            Err(e) => self.log.push(format!("Autocomplete: {e}")),
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => self.pending = None,
+                }
+            }
+
+            // O cursor pedido no quadro anterior (depois de aceitar uma sugestão).
+            if let Some((from, to)) = self.set_cursor.take() {
+                let mut state = egui::TextEdit::load_state(&ctx, id).unwrap_or_default();
+                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(from), egui::text::CCursor::new(to))));
+                state.store(&ctx, id);
+            }
+
+            // Teclas do popup, tomadas antes de o editor vê-las (senão Enter viraria quebra de linha).
+            let start = autocomplete::prefix_start(&t.text, self.cursor);
+            let prefix = autocomplete::prefix_text(&t.text, start, self.cursor);
+            let visible_len = self.popup.as_ref().map_or(0, |p| autocomplete::matching(&p.items, &prefix).len());
+            let mut accept = None;
+            let mut trigger = false;
+            let mut explicit = false;
+            if visible_len > 0
+                && let Some(p) = &mut self.popup
+            {
+                ui.input_mut(|i| {
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+                        p.selected = (p.selected + 1) % visible_len;
+                    }
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+                        p.selected = (p.selected + visible_len - 1) % visible_len;
+                    }
+                    if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) || i.consume_key(egui::Modifiers::NONE, egui::Key::Tab) {
+                        accept = Some(p.selected.min(visible_len - 1));
+                    }
+                });
+                if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                    self.popup = None;
+                }
+            }
+            if supported {
+                explicit = ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Space));
+                trigger = explicit;
+            }
+            if let Some(n) = accept.take()
+                && let Some(p) = self.popup.take()
+                && let Some(item) = autocomplete::matching(&p.items, &prefix).get(n).copied().cloned()
+            {
+                let (text, (from, to)) = autocomplete::apply(&t.text, self.cursor, start, &item);
+                t.text = text;
+                self.cursor = to;
+                let mut state = egui::TextEdit::load_state(&ctx, id).unwrap_or_default();
+                state.cursor.set_char_range(Some(egui::text::CCursorRange::two(egui::text::CCursor::new(from), egui::text::CCursor::new(to))));
+                state.store(&ctx, id);
+                changed_text = true;
+            }
+
             area.show(ui, |ui| {
                 ui.horizontal_top(|ui| {
                     ui.add(egui::Label::new(RichText::new(gutter).font(font.clone()).color(MUTED)).selectable(false));
                     let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, _wrap: f32| {
                         ui.painter().layout_job(highlight::layout_job(text.as_str(), lang, font.clone()))
                     };
-                    let r = ui.add(
-                        egui::TextEdit::multiline(&mut t.text)
-                            .font(font.clone())
-                            .lock_focus(true)
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(rows)
-                            .layouter(&mut layouter)
-                            .frame(egui::Frame::NONE),
-                    );
-                    if r.changed() {
+                    let out = egui::TextEdit::multiline(&mut t.text)
+                        .id(id)
+                        .font(font.clone())
+                        .lock_focus(true)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(rows)
+                        .layouter(&mut layouter)
+                        .frame(egui::Frame::NONE)
+                        .show(ui);
+                    if let Some(range) = out.cursor_range {
+                        self.cursor = range.primary.index.0;
+                    }
+                    changed_text |= out.response.changed();
+
+                    // Onde desenhar o popup: logo abaixo do cursor.
+                    let caret = out.galley.pos_from_cursor(egui::text::CCursor::new(self.cursor));
+                    let anchor = out.galley_pos + caret.left_bottom().to_vec2();
+
+                    if changed_text {
                         t.dirty = true;
+                        if t.lsp_version > 0 {
+                            t.lsp_version += 1;
+                            if let Some(c) = self.ac.client(path_lang) {
+                                let _ = c.did_change(&uri, t.lsp_version, &t.text);
+                            }
+                        }
+                        // `.` abre as sugestões; digitar dentro de uma lista cortada pelo servidor pede de novo.
+                        let before = t.text.chars().nth(self.cursor.saturating_sub(1));
+                        if before == Some('.') {
+                            trigger = true;
+                        } else if let Some(p) = &self.popup {
+                            if before.is_some_and(autocomplete::is_ident) {
+                                trigger = p.incomplete;
+                            } else {
+                                self.popup = None;
+                            }
+                        }
+                    }
+                    // O cursor saiu da palavra (setas, clique): fecha.
+                    if let Some(p) = &self.popup
+                        && (self.cursor < p.origin || autocomplete::prefix_start(&t.text, self.cursor) < p.origin)
+                    {
+                        self.popup = None;
+                    }
+
+                    if trigger
+                        && t.lsp_version > 0
+                        && let Some(c) = self.ac.client(path_lang)
+                    {
+                        let (line, col) = lsp::position_of(&t.text, self.cursor);
+                        self.pending = Some(Pending {
+                            rx: c.completion(&uri, line, col),
+                            tab: self.active,
+                            origin: autocomplete::prefix_start(&t.text, self.cursor),
+                            explicit,
+                        });
+                    } else if trigger {
+                        self.log.push("Autocomplete indisponível: o servidor desta linguagem ainda não está pronto.".into());
+                    }
+
+                    // Lista de sugestões.
+                    if let Some(p) = &mut self.popup {
+                        let prefix = autocomplete::prefix_text(&t.text, autocomplete::prefix_start(&t.text, self.cursor), self.cursor);
+                        let visible = autocomplete::matching(&p.items, &prefix);
+                        if visible.is_empty() {
+                            self.popup = None;
+                        } else {
+                            let selected = p.selected.min(visible.len() - 1);
+                            let mut clicked = None;
+                            egui::Area::new(egui::Id::unique("completion-popup"))
+                                .order(egui::Order::Foreground)
+                                .fixed_pos(anchor)
+                                .show(&ctx, |ui| {
+                                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                        ui.set_max_width(560.0);
+                                        for (i, it) in visible.iter().enumerate().skip(selected.saturating_sub(11)).take(12) {
+                                            let text = format!("{} {}", it.kind_letter(), it.label);
+                                            if ui.selectable_label(i == selected, RichText::new(text).monospace().small()).clicked() {
+                                                clicked = Some(i);
+                                            }
+                                        }
+                                    });
+                                });
+                            if let Some(n) = clicked {
+                                let item = visible[n].clone();
+                                let start = autocomplete::prefix_start(&t.text, self.cursor);
+                                let (text, (from, to)) = autocomplete::apply(&t.text, self.cursor, start, &item);
+                                t.text = text;
+                                self.cursor = to;
+                                self.set_cursor = Some((from, to));
+                                self.popup = None;
+                                t.dirty = true;
+                                if t.lsp_version > 0 {
+                                    t.lsp_version += 1;
+                                    if let Some(c) = self.ac.client(path_lang) {
+                                        let _ = c.did_change(&uri, t.lsp_version, &t.text);
+                                    }
+                                }
+                            }
+                        }
                     }
                 });
             });
+        }
+    }
+
+    /// Mantém os servidores de linguagem em dia com os documentos abertos: inicia o da linguagem do
+    /// arquivo ativo e abre nele os documentos que ainda não foram.
+    fn sync_language_servers(&mut self, ctx: &egui::Context) {
+        if self.ac.set_project(&self.folder) {
+            for t in &mut self.tabs {
+                t.lsp_version = 0;
+            }
+            self.popup = None;
+            self.pending = None;
+        }
+        if let Some(t) = self.tabs.get(self.active) {
+            let (root, ctx) = (self.sdk_root.clone(), ctx.clone());
+            self.ac.ensure(&root, highlight::lang_for(&t.path), move || ctx.request_repaint());
+        }
+        self.ac.poll();
+        for t in &mut self.tabs {
+            if t.lsp_version > 0 || t.text.len() > MAX_HIGHLIGHT_BYTES {
+                continue;
+            }
+            let lang = highlight::lang_for(&t.path);
+            let (Some(id), Some(c)) = (servers::language_id(lang), self.ac.client(lang)) else { continue };
+            if c.did_open(&lsp::path_to_uri(&t.path), id, 1, &t.text).is_ok() {
+                t.lsp_version = 1;
+            }
         }
     }
 }
@@ -922,10 +1155,17 @@ fn apply_theme(ctx: &egui::Context) {
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Desliga os servidores de linguagem e o logcat com educação; o `Drop` mata o que sobrar.
+        self.ac.shutdown();
+        self.logcat.disconnect();
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
         self.poll(ctx);
+        self.sync_language_servers(ctx);
         self.logcat.poll();
         self.terminal.poll();
         if self.folder != self.term_folder {
@@ -945,6 +1185,11 @@ impl eframe::App for App {
                     ui.label(RichText::new(format!("SDK: {installed} pacote(s) instalado(s)")).color(Color32::WHITE).small());
                     if let Some(job) = &self.job {
                         ui.label(RichText::new(job.phase.clone()).color(Color32::WHITE).small());
+                    }
+                    if let Some(t) = self.tabs.get(self.active)
+                        && let Some(status) = self.ac.status(&self.sdk_root, highlight::lang_for(&t.path))
+                    {
+                        ui.label(RichText::new(status).color(Color32::WHITE).small());
                     }
                 });
             });
@@ -988,3 +1233,7 @@ impl eframe::App for App {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "app_tests.rs"]
+mod tests;

@@ -1,13 +1,16 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod autocomplete;
 mod avd;
 mod catalog;
 mod diagnostics;
 mod highlight;
 mod logcat;
+mod lsp;
 mod project;
 mod sdk;
+mod servers;
 mod terminal;
 mod toolchain;
 
