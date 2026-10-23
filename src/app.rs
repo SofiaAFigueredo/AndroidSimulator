@@ -3,6 +3,7 @@
 
 use crate::avd;
 use crate::catalog::{self, Catalog, Package, Profile};
+use crate::highlight;
 use crate::sdk::{self, Event};
 use eframe::egui::{self, Color32, RichText};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -16,6 +17,8 @@ const ACCENT: Color32 = Color32::from_rgb(0x00, 0x7a, 0xcc);
 const TEXT: Color32 = Color32::from_rgb(0xcc, 0xcc, 0xcc);
 const MUTED: Color32 = Color32::from_rgb(0x85, 0x85, 0x85);
 const MAX_OPEN_BYTES: u64 = 2 * 1024 * 1024;
+/// Acima disso o realce é desligado, porque o texto é re-analisado a cada quadro.
+const MAX_HIGHLIGHT_BYTES: usize = 300_000;
 
 #[derive(PartialEq, Clone, Copy)]
 enum View {
@@ -72,8 +75,14 @@ impl App {
         let sdk_root = sdk::default_root();
         let folder = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let avds = avd::list(&sdk_root);
-        Self {
-            view: View::Devices,
+        // `android-simulator [pasta] [arquivo]` abre o projeto direto no Explorador.
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let (folder, view) = match args.first().map(PathBuf::from).filter(|p| p.is_dir()) {
+            Some(dir) => (dir, View::Explorer),
+            None => (folder, View::Devices),
+        };
+        let mut app = Self {
+            view,
             installed: sdk::installed(&sdk_root),
             accepted: sdk::accepted_licenses(&sdk_root),
             sdk_root,
@@ -92,7 +101,11 @@ impl App {
             avds,
             running: Vec::new(),
             log: vec!["Lendo o catálogo oficial do Google…".into()],
+        };
+        if let Some(file) = args.get(1) {
+            app.open_file(Path::new(file));
         }
+        app
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
@@ -506,14 +519,31 @@ impl App {
             return;
         }
         if let Some(t) = self.tabs.get_mut(self.active) {
+            let lang = if t.text.len() > MAX_HIGHLIGHT_BYTES { highlight::Lang::Plain } else { highlight::lang_for(&t.path) };
+            let font = egui::FontId::monospace(14.0);
+            let lines = t.text.split('\n').count();
+            let width = lines.to_string().len();
+            let gutter = (1..=lines).map(|n| format!("{n:>width$}")).collect::<Vec<_>>().join("\n");
+            let rows = (ui.available_height() / 18.0) as usize;
             egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-                let r = ui.add_sized(
-                    ui.available_size(),
-                    egui::TextEdit::multiline(&mut t.text).code_editor().lock_focus(true).frame(egui::Frame::NONE),
-                );
-                if r.changed() {
-                    t.dirty = true;
-                }
+                ui.horizontal_top(|ui| {
+                    ui.add(egui::Label::new(RichText::new(gutter).font(font.clone()).color(MUTED)).selectable(false));
+                    let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, _wrap: f32| {
+                        ui.painter().layout_job(highlight::layout_job(text.as_str(), lang, font.clone()))
+                    };
+                    let r = ui.add(
+                        egui::TextEdit::multiline(&mut t.text)
+                            .font(font.clone())
+                            .lock_focus(true)
+                            .desired_width(f32::INFINITY)
+                            .desired_rows(rows)
+                            .layouter(&mut layouter)
+                            .frame(egui::Frame::NONE),
+                    );
+                    if r.changed() {
+                        t.dirty = true;
+                    }
+                });
             });
         }
     }

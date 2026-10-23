@@ -3,6 +3,7 @@
 mod app;
 mod avd;
 mod catalog;
+mod highlight;
 mod sdk;
 
 fn main() -> eframe::Result {
