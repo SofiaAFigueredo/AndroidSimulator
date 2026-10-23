@@ -4,6 +4,7 @@ mod app;
 mod autocomplete;
 mod avd;
 mod catalog;
+mod device;
 mod diagnostics;
 mod highlight;
 mod logcat;

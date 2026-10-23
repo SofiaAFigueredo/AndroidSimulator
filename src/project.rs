@@ -89,13 +89,56 @@ pub fn create(dir: &Path, p: &NewProject) -> Result<(), String> {
         xml_escape(p.name)
     ))?;
     let src: PathBuf = pkg.split('.').collect();
-    write(&dir.join("app/src/main/java").join(src).join("MainActivity.kt"), &format!(
-        "package {pkg}\n\nimport android.app.Activity\nimport android.os.Bundle\nimport android.widget.TextView\n\n\
-         class MainActivity : Activity() {{\n    override fun onCreate(savedInstanceState: Bundle?) {{\n        super.onCreate(savedInstanceState)\n\
-         \x20       val texto = TextView(this)\n        texto.text = \"Olá, {}!\"\n        texto.textSize = 24f\n        setContentView(texto)\n    }}\n}}\n",
-        kt_escape(p.name)
-    ))
+    let activity = ACTIVITY_TEMPLATE.replace("__PKG__", pkg).replace("__NAME__", &kt_escape(p.name));
+    write(&dir.join("app/src/main/java").join(src).join("MainActivity.kt"), &activity)
 }
+
+/// A tela do app gerado: título, um botão que conta toques e um campo de texto. Serve para ver (e provar)
+/// que o simulador toca e digita no app de verdade.
+const ACTIVITY_TEMPLATE: &str = r#"package __PKG__
+
+import android.app.Activity
+import android.os.Bundle
+import android.widget.Button
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.TextView
+
+class MainActivity : Activity() {
+    private var cliques = 0
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val raiz = LinearLayout(this)
+        raiz.orientation = LinearLayout.VERTICAL
+        raiz.setPadding(32, 48, 32, 32)
+
+        val titulo = TextView(this)
+        titulo.text = "Olá, __NAME__!"
+        titulo.textSize = 24f
+
+        val contador = TextView(this)
+        contador.text = "Cliques: 0"
+        contador.textSize = 20f
+
+        val botao = Button(this)
+        botao.text = "Toque aqui"
+        botao.setOnClickListener {
+            cliques++
+            contador.text = "Cliques: $cliques"
+        }
+
+        val campo = EditText(this)
+        campo.hint = "Digite aqui"
+
+        raiz.addView(titulo)
+        raiz.addView(contador)
+        raiz.addView(botao)
+        raiz.addView(campo)
+        setContentView(raiz)
+    }
+}
+"#;
 
 pub fn jdk_home(root: &Path) -> PathBuf {
     root.join("jdk").join(crate::toolchain::JDK_MAJOR.to_string())
@@ -353,7 +396,7 @@ mod tests {
         let dir = sample_project(&root, &needed, "andsim-err");
         let file = dir.join("app/src/main/java/com/exemplo/teste/MainActivity.kt");
         let mut src = fs::read_to_string(&file).unwrap();
-        src = src.replace("texto.textSize = 24f", "texto.textSize = naoExiste");
+        src = src.replace("titulo.textSize = 24f", "titulo.textSize = naoExiste");
         fs::write(&file, &src).unwrap();
         let bad_line = src.lines().position(|l| l.contains("naoExiste")).unwrap() as u32 + 1;
 
