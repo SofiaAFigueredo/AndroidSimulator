@@ -419,4 +419,4 @@ add device 2: /dev/input/event1
 
 #[cfg(test)]
 #[path = "device_e2e.rs"]
-mod e2e;
+pub(crate) mod e2e;

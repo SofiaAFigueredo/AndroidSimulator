@@ -11,6 +11,7 @@ mod logcat;
 mod lsp;
 mod project;
 mod sdk;
+mod simulator;
 mod servers;
 mod terminal;
 mod toolchain;

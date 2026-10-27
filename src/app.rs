@@ -11,6 +11,7 @@ use crate::terminal::Terminal;
 use crate::lsp;
 use crate::project;
 use crate::servers;
+use crate::simulator::SimulatorView;
 use crate::toolchain;
 use crate::sdk::{self, Event};
 use eframe::egui::{self, Color32, RichText};
@@ -98,6 +99,11 @@ pub struct App {
     avds: Vec<String>,
     running: Vec<(String, u16, std::process::Child)>,
     ac: AutoComplete,
+    /// A tela do dispositivo ao vivo, no painel da direita.
+    sim: SimulatorView,
+    show_sim: bool,
+    /// Abrir o emulador na janela dele, em vez de dentro do app.
+    separate_window: bool,
     popup: Option<Popup>,
     pending: Option<Pending>,
     /// Cursor (índice de caractere) do editor no último quadro.
@@ -153,6 +159,9 @@ impl App {
             job: None,
             pending_license: None,
             ac: AutoComplete::default(),
+            sim: SimulatorView::default(),
+            show_sim: false,
+            separate_window: false,
             popup: None,
             pending: None,
             cursor: 0,
@@ -355,6 +364,16 @@ impl App {
                         self.view = view;
                     }
                 }
+                // O simulador não troca a barra lateral: abre e fecha o painel da direita.
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(48.0, 48.0), egui::Sense::click());
+                let color = if self.show_sim || resp.hovered() { Color32::WHITE } else { MUTED };
+                if self.show_sim {
+                    ui.painter().rect_filled(egui::Rect::from_min_size(rect.min, egui::vec2(2.0, 48.0)), 0.0, Color32::WHITE);
+                }
+                draw_simulator_icon(ui.painter(), rect.center(), color);
+                if resp.on_hover_text("Simulador (tela do dispositivo)").clicked() {
+                    self.show_sim = !self.show_sim;
+                }
             });
     }
 
@@ -550,6 +569,7 @@ impl App {
                 self.avds = avd::list(&self.sdk_root);
             }
         }
+        ui.checkbox(&mut self.separate_window, "Emulador em janela separada").on_hover_text("Por padrão o emulador roda sem janela e a tela aparece no painel do simulador");
         let mut start = None;
         let mut delete = None;
         let mut stop = None;
@@ -577,10 +597,12 @@ impl App {
         }
         if let Some(name) = start {
             let port = 5554 + 2 * self.running.len() as u16;
-            match avd::launch(&self.sdk_root, &name, &avd::Launch::new(false, port)) {
+            match avd::launch(&self.sdk_root, &name, &avd::Launch::new(!self.separate_window, port)) {
                 Ok(child) => {
                     self.log.push(format!("Iniciando {name} (console {port})."));
                     self.running.push((name, port, child));
+                    // Sem janela própria, a tela do emulador aparece no painel do simulador.
+                    self.show_sim = !self.separate_window;
                 }
                 Err(e) => self.log.push(format!("Não iniciei {name}: {e}")),
             }
@@ -651,6 +673,7 @@ impl App {
 
     /// Instala o APK compilado no primeiro emulador em execução e abre o app.
     fn run_app(&mut self, ctx: &egui::Context) {
+        self.show_sim = !self.separate_window;
         let (Some(apk), Some(&(_, port, _))) = (self.last_apk.clone(), self.running.first()) else { return };
         let Some(package) = project::application_id(&self.folder) else {
             self.log.push("Não achei o applicationId em app/build.gradle.kts.".into());
@@ -1108,6 +1131,14 @@ fn flavor(p: &Package) -> &str {
     }
 }
 
+/// Um celular com o triângulo de "executar" dentro.
+fn draw_simulator_icon(p: &egui::Painter, c: egui::Pos2, color: Color32) {
+    let stroke = egui::Stroke::new(1.8, color);
+    p.rect_stroke(egui::Rect::from_center_size(c, egui::vec2(16.0, 26.0)), 3.0, stroke, egui::StrokeKind::Middle);
+    let tri = vec![c + egui::vec2(-3.0, -5.0), c + egui::vec2(-3.0, 5.0), c + egui::vec2(4.0, 0.0)];
+    p.add(egui::Shape::convex_polygon(tri, color, egui::Stroke::NONE));
+}
+
 fn draw_icon(p: &egui::Painter, c: egui::Pos2, view: View, color: Color32) {
     let stroke = egui::Stroke::new(1.8, color);
     match view {
@@ -1159,6 +1190,7 @@ impl eframe::App for App {
         // Desliga os servidores de linguagem e o logcat com educação; o `Drop` mata o que sobrar.
         self.ac.shutdown();
         self.logcat.disconnect();
+        self.sim.stop();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1221,6 +1253,18 @@ impl eframe::App for App {
 
         self.activity_bar(ui);
         self.sidebar(ui);
+        if self.show_sim {
+            egui::Panel::right("simulator")
+                .default_size(360.0)
+                .size_range(260.0..=720.0)
+                .frame(egui::Frame::new().fill(SIDEBAR).inner_margin(8.0))
+                .show(ui, |ui| {
+                    let port = self.running.first().map(|(_, p, _)| *p);
+                    self.sim.ui(ui, &self.sdk_root, port);
+                });
+        } else {
+            self.sim.stop();
+        }
         egui::CentralPanel::default().show(ui, |ui| self.editor(ui));
         self.license_window(ctx);
         self.new_project_window(ctx);

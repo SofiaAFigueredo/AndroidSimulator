@@ -3,12 +3,12 @@
 use super::*;
 
 /// A árvore de interface do Android (`uiautomator dump`), para conferir o que o app mostra sem olhar pixels.
-fn ui_dump(root: &Path, port: u16) -> String {
+pub(crate) fn ui_dump(root: &Path, port: u16) -> String {
     avd::adb(root, &["-s", &avd::serial(port), "shell", "uiautomator dump /sdcard/ui.xml >/dev/null 2>&1; cat /sdcard/ui.xml"]).unwrap_or_default()
 }
 
 /// `[x1,y1][x2,y2]` do nó que contém `needle`.
-fn node_bounds(xml: &str, needle: &str) -> Option<(f32, f32, f32, f32)> {
+pub(crate) fn node_bounds(xml: &str, needle: &str) -> Option<(f32, f32, f32, f32)> {
     let at = xml.find(needle)?;
     let from = xml[..at].rfind("<node")?;
     let to = at + xml[at..].find('>')?;
@@ -18,7 +18,7 @@ fn node_bounds(xml: &str, needle: &str) -> Option<(f32, f32, f32, f32)> {
     (n.len() == 4).then(|| (n[0], n[1], n[2], n[3]))
 }
 
-fn wait_for(root: &Path, port: u16, needle: &str, secs: u64) -> Result<String, String> {
+pub(crate) fn wait_for(root: &Path, port: u16, needle: &str, secs: u64) -> Result<String, String> {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
         let xml = ui_dump(root, port);

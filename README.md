@@ -66,6 +66,7 @@ botão **Compactar imagens** faz o mesmo nas já instaladas. Medido nas três im
 - [x] Logcat (filtro por nível e texto) e terminal integrado, em abas no painel inferior
 - [x] Build via Gradle, com erros do Kotlin, javac e aapt2 clicáveis no painel de saída
 - [x] Executar: instala o APK no emulador e abre o app; Captura salva a tela do emulador
+- [x] Simulador: tela ao vivo no painel, mouse como dedo, teclado e botões de hardware
 - [x] Autocomplete via LSP para Java (jdtls) e Kotlin (kotlin-language-server), com classes do Android
 
 ## Logcat e terminal
@@ -79,6 +80,31 @@ O painel inferior tem três abas: **Saída** (downloads, Gradle, emulador), **Lo
   `java` já no PATH e `JAVA_HOME` apontando para o JDK do app. Tem `cd`, `clear`, histórico (↑/↓) e o botão
   Parar. Não é um PTY: programas interativos (vim, REPLs) não funcionam. Não usa nenhuma biblioteca de
   terminal, para o binário continuar pequeno.
+
+## Simulador (a tela do app dentro do app)
+
+O emulador roda **sem janela** e a tela dele aparece num painel à direita do app (ícone do celular na barra
+de atividades, ou automaticamente ao iniciar um emulador e ao usar **Executar**). Dá para usar o app como num
+celular:
+
+- **Mouse** é o dedo: clicar toca, arrastar arrasta (em tempo real) e a roda do mouse rola a tela.
+- **Teclado**: depois de clicar no painel, o texto digitado e Enter, Backspace, Delete, Tab, setas e Esc
+  (Voltar) vão para o app.
+- **Botões**: Voltar, Início, Recentes, Energia, Vol + e Vol -.
+- Marque **Emulador em janela separada** na aba Dispositivos para usar a janela do próprio emulador.
+
+Como funciona (sem biblioteca de vídeo nem gRPC, para o binário continuar pequeno): um único processo
+`screencap` no dispositivo transmite os quadros crus (cerca de **8 a 9 quadros por segundo** medidos num
+emulador 480x800 sem placa de vídeo), e o toque é gravado direto no dispositivo de entrada multitoque do
+emulador com `sendevent`, o que permite arrastar de verdade, e não só tocar.
+
+Verificado de ponta a ponta, num app compilado pelo próprio app: um clique de mouse no painel contou 1 no
+botão do app, arrastar para fora do botão não contou, e o texto digitado chegou ao campo e foi apagado.
+O app de exemplo gerado tem um botão contador e um campo de texto justamente para isso.
+
+Limitações: a tela não gira (o toque é gravado nas coordenadas do painel em pé); não há multitoque
+(pinça) nem sensores; a taxa de quadros depende do emulador (sem placa de vídeo é a do `screencap`);
+as imagens ATD não desenham a interface e o painel mostra preto.
 
 ## Autocomplete (LSP)
 
