@@ -140,6 +140,49 @@ pub fn snippet_to_plain(s: &str) -> (String, Option<(usize, usize)>) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Diagnósticos (`textDocument/publishDiagnostics`).
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Diag {
+    /// `(linha, coluna em UTF-16)`, 0-based.
+    pub start: (u32, u32),
+    pub end: (u32, u32),
+    /// 1 erro, 2 aviso, 3 informação, 4 dica.
+    pub severity: u8,
+    pub message: String,
+    pub source: Option<String>,
+}
+
+/// Chave para comparar URIs de arquivo: os servidores devolvem `file:///c%3A/Users/…` com maiúsculas,
+/// minúsculas e `:` codificado de formas diferentes da que enviamos.
+pub fn uri_key(uri: &str) -> String {
+    let decoded = crate::diagnostics::percent_decode(uri);
+    let path = decoded.trim_start_matches("file://").trim_start_matches('/').replace('\\', "/");
+    if cfg!(windows) { path.to_lowercase() } else { format!("/{path}") }
+}
+
+/// Interpreta os `params` de `textDocument/publishDiagnostics`: a URI e a lista (que substitui a anterior).
+pub fn parse_diagnostics(params: &Value) -> Option<(String, Vec<Diag>)> {
+    let uri = params.get("uri")?.as_str()?.to_owned();
+    let list = params
+        .get("diagnostics")?
+        .as_array()?
+        .iter()
+        .filter_map(|d| {
+            let range = d.get("range")?;
+            Some(Diag {
+                start: position(range.get("start")?)?,
+                end: position(range.get("end")?)?,
+                severity: d.get("severity").and_then(Value::as_u64).unwrap_or(1) as u8,
+                message: d.get("message")?.as_str()?.trim().to_owned(),
+                source: d.get("source").and_then(Value::as_str).map(str::to_owned),
+            })
+        })
+        .collect();
+    Some((uri, list))
+}
+
+// ---------------------------------------------------------------------------------------------
 // Itens de completion.
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -257,6 +300,8 @@ struct Inner {
     child: Mutex<Child>,
     /// Últimas linhas que o servidor escreveu no stderr, para diagnosticar falhas.
     stderr: Mutex<VecDeque<String>>,
+    /// Diagnósticos publicados pelo servidor, por documento (chave: `uri_key`).
+    diags: Mutex<HashMap<String, Vec<Diag>>>,
 }
 
 impl Inner {
@@ -295,6 +340,7 @@ impl Client {
             next_id: AtomicI64::new(1),
             child: Mutex::new(child),
             stderr: Mutex::new(VecDeque::new()),
+            diags: Mutex::new(HashMap::new()),
         });
 
         let weak = Arc::downgrade(&inner);
@@ -329,6 +375,12 @@ impl Client {
                         q.pop_front();
                     }
                     q.push_back(text.lines().next().unwrap_or_default().to_owned());
+                }
+                if msg.get("method").and_then(Value::as_str) == Some("textDocument/publishDiagnostics")
+                    && let Some((uri, list)) = msg.get("params").and_then(parse_diagnostics)
+                    && let Ok(mut d) = inner.diags.lock()
+                {
+                    d.insert(uri_key(&uri), list);
                 }
                 if msg.get("method").is_some() {
                     // Pedido do servidor para nós (registerCapability, workDoneProgress/create…):
@@ -369,7 +421,8 @@ impl Client {
                 "capabilities": {
                     "textDocument": {
                         "synchronization": {"didSave": false, "dynamicRegistration": false},
-                        "completion": {"completionItem": {"snippetSupport": true, "documentationFormat": ["plaintext"]}}
+                        "completion": {"completionItem": {"snippetSupport": true, "documentationFormat": ["plaintext"]}},
+                        "publishDiagnostics": {"relatedInformation": false}
                     },
                     "workspace": {"workspaceFolders": true, "configuration": false}
                 }
@@ -421,7 +474,15 @@ impl Client {
     }
 
     pub fn did_close(&self, uri: &str) -> Result<(), String> {
+        if let Ok(mut d) = self.inner.diags.lock() {
+            d.remove(&uri_key(uri));
+        }
         self.notify("textDocument/didClose", json!({"textDocument": {"uri": uri}}))
+    }
+
+    /// Os diagnósticos mais recentes que o servidor publicou para o documento.
+    pub fn diagnostics(&self, uri: &str) -> Vec<Diag> {
+        self.inner.diags.lock().ok().and_then(|d| d.get(&uri_key(uri)).cloned()).unwrap_or_default()
     }
 
     pub fn completion(&self, uri: &str, line: u32, character: u32) -> Receiver<Result<Value, String>> {
@@ -504,6 +565,36 @@ mod tests {
         assert_eq!(parse_completion(&json!([{"label": "a"}])).len(), 1);
         assert!(parse_completion(&Value::Null).is_empty());
         assert!(!is_incomplete(&v) && is_incomplete(&json!({"isIncomplete": true, "items": []})) && !is_incomplete(&json!([])));
+    }
+
+    #[test]
+    fn parses_published_diagnostics() {
+        let p = json!({"uri": "file:///C:/p/Main.java", "diagnostics": [
+            {"range": {"start": {"line": 3, "character": 12}, "end": {"line": 3, "character": 19}}, "severity": 1,
+             "message": "Type mismatch: cannot convert from String to int\n", "source": "Java"},
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "message": "sem severidade"},
+            {"range": {"start": {"line": 1}}, "message": "range quebrado"},
+            {"message": "sem range"}
+        ]});
+        let (uri, list) = parse_diagnostics(&p).unwrap();
+        assert_eq!(uri, "file:///C:/p/Main.java");
+        assert_eq!(list.len(), 2, "os malformados são descartados");
+        assert_eq!((list[0].start, list[0].end, list[0].severity), ((3, 12), (3, 19), 1));
+        assert_eq!(list[0].message, "Type mismatch: cannot convert from String to int");
+        assert_eq!(list[0].source.as_deref(), Some("Java"));
+        assert_eq!(list[1].severity, 1, "sem severidade vale erro");
+        assert!(parse_diagnostics(&json!({"diagnostics": []})).is_none());
+        assert_eq!(parse_diagnostics(&json!({"uri": "file:///x", "diagnostics": []})).unwrap().1.len(), 0, "lista vazia limpa os erros");
+    }
+
+    #[test]
+    fn uri_keys_ignore_how_the_server_spells_the_path() {
+        let ours = path_to_uri(Path::new(r"C:\Users\Sofia\Meu App\A.kt"));
+        let theirs = "file:///c%3A/Users/Sofia/Meu%20App/A.kt";
+        if cfg!(windows) {
+            assert_eq!(uri_key(&ours), uri_key(theirs));
+        }
+        assert_ne!(uri_key("file:///x/A.kt"), uri_key("file:///x/B.kt"));
     }
 
     #[test]

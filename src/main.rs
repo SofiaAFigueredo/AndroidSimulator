@@ -9,6 +9,7 @@ mod diagnostics;
 mod highlight;
 mod logcat;
 mod lsp;
+mod problems;
 mod project;
 mod sdk;
 mod simulator;

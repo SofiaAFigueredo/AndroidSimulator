@@ -9,13 +9,14 @@ use crate::highlight;
 use crate::logcat::LogcatView;
 use crate::terminal::Terminal;
 use crate::lsp;
+use crate::problems::{self, Problem};
 use crate::project;
 use crate::servers;
 use crate::simulator::SimulatorView;
 use crate::toolchain;
 use crate::sdk::{self, Event};
 use eframe::egui::{self, Color32, RichText};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 
@@ -32,6 +33,7 @@ const MAX_HIGHLIGHT_BYTES: usize = 300_000;
 #[derive(PartialEq, Clone, Copy)]
 enum Bottom {
     Output,
+    Problems,
     Logcat,
     Terminal,
 }
@@ -101,6 +103,9 @@ pub struct App {
     ac: AutoComplete,
     /// A tela do dispositivo ao vivo, no painel da direita.
     sim: SimulatorView,
+    /// O que o Gradle reclamou na última compilação, por arquivo (chave: `lsp::uri_key`); é apagado do
+    /// arquivo que o usuário edita, porque as posições deixam de valer.
+    build_problems: HashMap<String, (PathBuf, Vec<Problem>)>,
     show_sim: bool,
     /// Abrir o emulador na janela dele, em vez de dentro do app.
     separate_window: bool,
@@ -160,6 +165,7 @@ impl App {
             pending_license: None,
             ac: AutoComplete::default(),
             sim: SimulatorView::default(),
+            build_problems: HashMap::new(),
             show_sim: false,
             separate_window: false,
             popup: None,
@@ -208,7 +214,13 @@ impl App {
         if let Some(rx) = &self.build_rx {
             while let Ok(m) = rx.try_recv() {
                 match m {
-                    BuildMsg::Line(l) => self.log.push(l),
+                    BuildMsg::Line(l) => {
+                        if let Some(d) = diagnostics::parse_line(&l) {
+                            let key = lsp::uri_key(&lsp::path_to_uri(&d.path));
+                            self.build_problems.entry(key).or_insert_with(|| (d.path.clone(), Vec::new())).1.push(problems::from_gradle(&d));
+                        }
+                        self.log.push(l);
+                    }
                     BuildMsg::Done(r) => build_done = Some(r),
                 }
             }
@@ -659,6 +671,7 @@ impl App {
         }
         let (tx, rx) = mpsc::channel();
         let (root, project, ctx) = (self.sdk_root.clone(), self.folder.clone(), ctx.clone());
+        self.build_problems.clear();
         self.log.push(format!("Compilando {}…", project.display()));
         self.build_rx = Some(rx);
         std::thread::spawn(move || {
@@ -714,6 +727,50 @@ impl App {
         });
         if let Some(d) = jump {
             self.open_file_at(&d.path, d.line);
+        }
+    }
+
+    /// Todos os problemas: dos arquivos abertos (servidor de linguagem + Gradle) e os da última compilação
+    /// em arquivos que não estão abertos. Erros primeiro.
+    fn all_problems(&self) -> Vec<(PathBuf, Problem)> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for t in &self.tabs {
+            let uri = lsp::path_to_uri(&t.path);
+            for p in tab_problems(&self.ac, &self.build_problems, t, highlight::lang_for(&t.path), &uri) {
+                out.push((t.path.clone(), p));
+            }
+            seen.insert(lsp::uri_key(&uri));
+        }
+        for (key, (path, list)) in &self.build_problems {
+            if !seen.contains(key) {
+                out.extend(list.iter().map(|p| (path.clone(), p.clone())));
+            }
+        }
+        out.sort_by(|a, b| a.1.severity.cmp(&b.1.severity).then_with(|| a.0.cmp(&b.0)).then_with(|| a.1.line.cmp(&b.1.line)));
+        out
+    }
+
+    /// A aba Problemas: clicar numa linha abre o arquivo no lugar.
+    fn problems_view(&mut self, ui: &mut egui::Ui, list: &[(PathBuf, Problem)]) {
+        if list.is_empty() {
+            ui.label(RichText::new("Nenhum problema nos arquivos abertos nem na última compilação.").small().color(MUTED));
+            return;
+        }
+        let row = ui.text_style_height(&egui::TextStyle::Small) + 2.0;
+        let mut jump = None;
+        egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, row, list.len(), |ui, range| {
+            for (path, p) in &list[range] {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let text = format!("{:<5} {name}:{}:{}  {}  [{}]", p.severity.label(), p.line + 1, p.col + 1, p.message, p.source);
+                let label = egui::Label::new(RichText::new(text).monospace().small().color(p.severity.color())).sense(egui::Sense::click());
+                if ui.add(label).on_hover_text("Abrir no editor").clicked() {
+                    jump = Some((path.clone(), p.line + 1));
+                }
+            }
+        });
+        if let Some((path, line)) = jump {
+            self.open_file_at(&path, line);
         }
     }
 
@@ -908,6 +965,10 @@ impl App {
             let supported = servers::language_id(path_lang).is_some() && t.text.len() <= MAX_HIGHLIGHT_BYTES;
             let mut changed_text = false;
 
+            // Problemas deste arquivo (LSP + Gradle): viram o sublinhado e o tooltip.
+            let tab_problems = tab_problems(&self.ac, &self.build_problems, t, path_lang, &uri);
+            let marks = problems::marks(&t.text, &tab_problems);
+
             // Resposta do servidor a um pedido de completion.
             if let Some(p) = &self.pending {
                 match p.rx.try_recv() {
@@ -984,7 +1045,7 @@ impl App {
                 ui.horizontal_top(|ui| {
                     ui.add(egui::Label::new(RichText::new(gutter).font(font.clone()).color(MUTED)).selectable(false));
                     let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, _wrap: f32| {
-                        ui.painter().layout_job(highlight::layout_job(text.as_str(), lang, font.clone()))
+                        ui.painter().layout_job(highlight::layout_job(text.as_str(), lang, font.clone(), &marks))
                     };
                     let out = egui::TextEdit::multiline(&mut t.text)
                         .id(id)
@@ -1000,12 +1061,24 @@ impl App {
                     }
                     changed_text |= out.response.changed();
 
+                    // Passar o mouse sobre um trecho sublinhado mostra a mensagem do problema.
+                    if out.response.hovered()
+                        && !tab_problems.is_empty()
+                        && let Some(pos) = ui.input(|i| i.pointer.hover_pos())
+                    {
+                        let idx = out.galley.cursor_from_pos(pos - out.galley_pos).index.0;
+                        if let Some(message) = problems::message_at(&t.text, &tab_problems, idx) {
+                            out.response.show_tooltip_text(message);
+                        }
+                    }
+
                     // Onde desenhar o popup: logo abaixo do cursor.
                     let caret = out.galley.pos_from_cursor(egui::text::CCursor::new(self.cursor));
                     let anchor = out.galley_pos + caret.left_bottom().to_vec2();
 
                     if changed_text {
                         t.dirty = true;
+                        self.build_problems.remove(&lsp::uri_key(&uri));
                         if t.lsp_version > 0 {
                             t.lsp_version += 1;
                             if let Some(c) = self.ac.client(path_lang) {
@@ -1131,6 +1204,28 @@ fn flavor(p: &Package) -> &str {
     }
 }
 
+fn source_name(lang: highlight::Lang) -> &'static str {
+    match lang {
+        highlight::Lang::Java => "Java",
+        highlight::Lang::Kotlin => "Kotlin",
+        _ => "Editor",
+    }
+}
+
+/// Problemas de um arquivo aberto: o que o servidor de linguagem publicou mais o que o Gradle reclamou.
+fn tab_problems(ac: &AutoComplete, build: &HashMap<String, (PathBuf, Vec<Problem>)>, t: &Tab, lang: highlight::Lang, uri: &str) -> Vec<Problem> {
+    let mut out = Vec::new();
+    if t.lsp_version > 0
+        && let Some(c) = ac.client(lang)
+    {
+        out.extend(c.diagnostics(uri).iter().map(|d| problems::from_lsp(d, source_name(lang))));
+    }
+    if let Some((_, list)) = build.get(&lsp::uri_key(uri)) {
+        out.extend(list.iter().cloned());
+    }
+    out
+}
+
 /// Um celular com o triângulo de "executar" dentro.
 fn draw_simulator_icon(p: &egui::Painter, c: egui::Pos2, color: Color32) {
     let stroke = egui::Stroke::new(1.8, color);
@@ -1198,6 +1293,7 @@ impl eframe::App for App {
         let ctx = &ctx;
         self.poll(ctx);
         self.sync_language_servers(ctx);
+        let problems = self.all_problems();
         self.logcat.poll();
         self.terminal.poll();
         if self.folder != self.term_folder {
@@ -1223,6 +1319,10 @@ impl eframe::App for App {
                     {
                         ui.label(RichText::new(status).color(Color32::WHITE).small());
                     }
+                    let (errors, warnings) = problems::counts(problems.iter().map(|(_, p)| p));
+                    if errors + warnings > 0 {
+                        ui.label(RichText::new(format!("{errors} erro(s), {warnings} aviso(s)")).color(Color32::WHITE).small());
+                    }
                 });
             });
 
@@ -1232,7 +1332,14 @@ impl eframe::App for App {
             .frame(egui::Frame::new().fill(BG).inner_margin(8.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    for (tab, label) in [(Bottom::Output, "SAÍDA"), (Bottom::Logcat, "LOGCAT"), (Bottom::Terminal, "TERMINAL")] {
+                    let (errors, warnings) = problems::counts(problems.iter().map(|(_, p)| p));
+                    let problems_label = if errors + warnings > 0 { format!("PROBLEMAS ({errors}/{warnings})") } else { "PROBLEMAS".to_owned() };
+                    for (tab, label) in [
+                        (Bottom::Output, "SAÍDA".to_owned()),
+                        (Bottom::Problems, problems_label),
+                        (Bottom::Logcat, "LOGCAT".to_owned()),
+                        (Bottom::Terminal, "TERMINAL".to_owned()),
+                    ] {
                         if ui.selectable_label(self.bottom == tab, RichText::new(label).small()).clicked() {
                             self.bottom = tab;
                         }
@@ -1244,6 +1351,7 @@ impl eframe::App for App {
                         let port = self.running.first().map(|(_, p, _)| *p);
                         self.logcat.ui(ui, &self.sdk_root, port);
                     }
+                    Bottom::Problems => self.problems_view(ui, &problems),
                     Bottom::Terminal => {
                         let ctx = ui.ctx().clone();
                         self.terminal.ui(ui, &self.sdk_root, &ctx);

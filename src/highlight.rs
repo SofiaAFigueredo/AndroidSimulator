@@ -1,7 +1,7 @@
 //! Realce de sintaxe leve, escrito à mão (sem tree-sitter) para manter o binário pequeno.
 //! Cobre o que um projeto Android usa: Kotlin, Java e XML.
 
-use eframe::egui::{Color32, FontId, text::{LayoutJob, TextFormat}};
+use eframe::egui::{Color32, FontId, Stroke, text::{LayoutJob, TextFormat}};
 use std::path::Path;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -206,12 +206,47 @@ fn color(t: Tok) -> Color32 {
     }
 }
 
-/// Texto colorido, sem quebra de linha (assim o número de linha da lateral sempre alinha).
-pub fn layout_job(text: &str, lang: Lang, font: FontId) -> LayoutJob {
+/// Um trecho a sublinhar (erro, aviso…), em bytes do texto.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mark {
+    pub start: usize,
+    pub end: usize,
+    pub color: Color32,
+}
+
+/// Os tokens, cortados nas bordas das marcas. Cada pedaço diz se fica sublinhado (e de que cor); com mais
+/// de uma marca no mesmo lugar vale a primeira da lista. Marcas fora do texto ou que cortariam um caractere
+/// no meio são ignoradas (o texto pode ter mudado desde que elas foram calculadas).
+pub fn segments(text: &str, lang: Lang, marks: &[Mark]) -> Vec<(usize, usize, Tok, Option<Color32>)> {
+    let valid: Vec<&Mark> =
+        marks.iter().filter(|m| m.start < m.end && m.end <= text.len() && text.is_char_boundary(m.start) && text.is_char_boundary(m.end)).collect();
+    let mut out = Vec::new();
+    for (a, b, t) in tokens(text, lang) {
+        let mut cuts = vec![a, b];
+        for m in &valid {
+            cuts.extend([m.start, m.end].into_iter().filter(|c| *c > a && *c < b));
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        for w in cuts.windows(2) {
+            let under = valid.iter().find(|m| m.start <= w[0] && w[1] <= m.end).map(|m| m.color);
+            out.push((w[0], w[1], t, under));
+        }
+    }
+    out
+}
+
+/// Texto colorido, sem quebra de linha (assim o número de linha da lateral sempre alinha), com os trechos
+/// de `marks` sublinhados.
+pub fn layout_job(text: &str, lang: Lang, font: FontId, marks: &[Mark]) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.wrap.max_width = f32::INFINITY;
-    for (a, b, t) in tokens(text, lang) {
-        job.append(&text[a..b], 0.0, TextFormat::simple(font.clone(), color(t)));
+    for (a, b, t, under) in segments(text, lang, marks) {
+        let mut format = TextFormat::simple(font.clone(), color(t));
+        if let Some(c) = under {
+            format.underline = Stroke::new(1.5, c);
+        }
+        job.append(&text[a..b], 0.0, format);
     }
     job
 }
@@ -222,6 +257,42 @@ mod tests {
 
     fn kinds(text: &str, lang: Lang) -> Vec<(&str, Tok)> {
         tokens(text, lang).into_iter().map(|(a, b, t)| (&text[a..b], t)).collect()
+    }
+
+    #[test]
+    fn segments_split_tokens_at_the_mark_borders_and_underline_only_the_mark() {
+        let text = "val x: Int = \"texto\" // ok";
+        let start = text.find("\"texto\"").unwrap();
+        let red = Color32::RED;
+        let seg = segments(text, Lang::Kotlin, &[Mark { start: start + 1, end: start + 6, color: red }]);
+        let under: String = seg.iter().filter(|s| s.3 == Some(red)).map(|s| &text[s.0..s.1]).collect();
+        assert_eq!(under, "texto", "só o trecho marcado, que está no meio de um token de texto");
+        let all: String = seg.iter().map(|s| &text[s.0..s.1]).collect();
+        assert_eq!(all, text, "cortar nas marcas não pode perder nem repetir texto");
+    }
+
+    #[test]
+    fn invalid_marks_are_ignored_instead_of_panicking() {
+        let text = "ação";
+        let marks = [
+            Mark { start: 2, end: 3, color: Color32::RED }, // no meio do "ç"
+            Mark { start: 0, end: 99, color: Color32::RED }, // além do fim
+            Mark { start: 3, end: 3, color: Color32::RED },  // vazia
+        ];
+        let seg = segments(text, Lang::Plain, &marks);
+        assert!(seg.iter().all(|s| s.3.is_none()));
+        let all: String = seg.iter().map(|s| &text[s.0..s.1]).collect();
+        assert_eq!(all, text);
+        let _ = layout_job(text, Lang::Plain, FontId::monospace(14.0), &marks);
+    }
+
+    #[test]
+    fn the_first_mark_wins_where_they_overlap() {
+        let text = "abcdef";
+        let (red, yellow) = (Color32::RED, Color32::YELLOW);
+        let seg = segments(text, Lang::Plain, &[Mark { start: 1, end: 3, color: red }, Mark { start: 2, end: 5, color: yellow }]);
+        let color_of = |i: usize| seg.iter().find(|s| s.0 <= i && i < s.1).and_then(|s| s.3);
+        assert_eq!((color_of(0), color_of(1), color_of(2), color_of(3), color_of(5)), (None, Some(red), Some(red), Some(yellow), None));
     }
 
     #[test]

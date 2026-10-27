@@ -106,6 +106,29 @@ Limitações: a tela não gira (o toque é gravado nas coordenadas do painel em 
 (pinça) nem sensores; a taxa de quadros depende do emulador (sem placa de vídeo é a do `screencap`);
 as imagens ATD não desenham a interface e o painel mostra preto.
 
+## Problemas (erros sublinhados)
+
+Erros e avisos aparecem no editor, de duas fontes que se somam:
+
+- **Servidores de linguagem (LSP):** enquanto você digita, o jdtls (Java) e o kotlin-language-server publicam o
+  que está errado e o app sublinha o trecho (vermelho para erro, amarelo para aviso). Corrigiu, o sublinhado some.
+- **Gradle:** os erros da última compilação (Kotlin, javac e aapt2) são sublinhados no arquivo e listados
+  mesmo com o arquivo fechado. Editar o arquivo apaga os problemas do Gradle dele, porque as posições deixam
+  de valer até a próxima compilação.
+
+Passar o mouse sobre o trecho mostra a mensagem (`Erro (Java): …`). A aba **PROBLEMAS** do painel inferior lista
+tudo (erros primeiro; clicar abre o arquivo na linha) e a barra de status mostra a contagem.
+
+Verificado com os servidores reais, dirigindo o editor por eventos de teclado simulados: digitar uma aspa
+solta num `.java` gerou o erro `String literal is not properly closed…` na linha certa, e um erro de
+compilação do Gradle apareceu na lista, foi sublinhado em `naoExiste` e sumiu ao editar. Nos servidores, o
+erro de tipo `int x = "texto"` (Java) e `val x: Int = "texto"` (Kotlin) chegou com a posição exata e sumiu
+depois de corrigir (o Java levou ~35 s na primeira vez, com o servidor iniciando a frio; o Kotlin ~9 s).
+
+Limitações: o sublinhado é reto (o egui não tem ondulado); só há diagnósticos de Java e Kotlin (XML não);
+o servidor só analisa arquivos abertos; erros que dependem de dependências do `build.gradle` (o import do
+Gradle está desligado no jdtls) podem não aparecer até compilar.
+
 ## Autocomplete (LSP)
 
 O editor sugere código em Java e Kotlin falando LSP com servidores que o app baixa na Completa
@@ -125,7 +148,7 @@ Limitações: o servidor Kotlin devolve no máximo 75 itens (o app pede de novo 
 depois de abrir um arquivo a primeira resposta pode vir vazia, enquanto o servidor analisa (o app avisa e
 basta repetir o atalho); o import do Gradle é desligado, então o classpath é a `android.jar` mais a
 biblioteca padrão e não as dependências do `build.gradle`; cada servidor é um processo Java (o jdtls
-reserva até 1 GB de memória). Não há diagnósticos (sublinhado de erros) nem ir-para-definição.
+reserva até 1 GB de memória). Não há ir-para-definição.
 
 ## Rodar
 

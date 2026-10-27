@@ -14,7 +14,7 @@ pub struct Diagnostic {
 
 const EXTENSIONS: [&str; 4] = [".kt", ".kts", ".java", ".xml"];
 
-fn percent_decode(s: &str) -> String {
+pub fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;

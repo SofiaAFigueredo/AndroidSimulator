@@ -387,4 +387,49 @@ class Main
             let _ = std::fs::remove_dir_all(project);
         }
     }
+
+    /// Código com erro de tipo: os servidores reais precisam publicar um diagnóstico de erro, na linha certa.
+    /// `cargo test diagnostics_arrive_from_the_real_servers -- --ignored --nocapture`
+    #[test]
+    #[ignore = "inicia o jdtls e o kotlin-language-server"]
+    fn diagnostics_arrive_from_the_real_servers() {
+        let root = crate::sdk::default_root();
+        for (lang, file, code, bad_line) in [
+            (Lang::Java, "src/Main.java", "public class Main {\n    public static void main(String[] args) {\n        int x = \"texto\";\n    }\n}\n", 2u32),
+            (Lang::Kotlin, "Main.kt", "fun main() {\n    val x: Int = \"texto\"\n    println(x)\n}\n", 1u32),
+        ] {
+            assert!(installed(&root, lang), "instale o servidor de {lang:?}");
+            let project = tmp(&format!("diag-{lang:?}"));
+            let path = project.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, code).unwrap();
+            let t0 = Instant::now();
+            let client = start(&root, lang, &project).expect("iniciar o servidor");
+            let uri = lsp::path_to_uri(&path);
+            client.did_open(&uri, language_id(lang).unwrap(), 1, code).unwrap();
+            let found = loop {
+                let errors: Vec<lsp::Diag> = client.diagnostics(&uri).into_iter().filter(|d| d.severity == 1).collect();
+                if !errors.is_empty() {
+                    break errors;
+                }
+                assert!(t0.elapsed() < Duration::from_secs(120), "{lang:?}: nenhum erro em 120 s");
+                std::thread::sleep(Duration::from_millis(500));
+            };
+            println!("RESULTADO {lang:?} em {:?}: {:?}", t0.elapsed(), found[0]);
+            assert_eq!(found[0].start.0, bad_line, "{lang:?}: erro na linha errada: {:?}", found[0]);
+            assert!(!found[0].message.is_empty());
+
+            // Corrigido o código, os erros somem (o servidor publica a lista vazia).
+            let fixed = code.replace("\"texto\"", "42");
+            client.did_change(&uri, 2, &fixed).unwrap();
+            let t1 = Instant::now();
+            while !client.diagnostics(&uri).iter().all(|d| d.severity != 1) {
+                assert!(t1.elapsed() < Duration::from_secs(60), "{lang:?}: o erro não sumiu depois da correção: {:?}", client.diagnostics(&uri));
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            println!("RESULTADO {lang:?}: erro sumiu depois de corrigir ({:?})", t1.elapsed());
+            client.shutdown();
+            let _ = std::fs::remove_dir_all(project);
+        }
+    }
 }
