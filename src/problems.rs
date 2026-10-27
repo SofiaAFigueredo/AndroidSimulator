@@ -114,7 +114,7 @@ pub fn marks(text: &str, problems: &[Problem]) -> Vec<Mark> {
         .into_iter()
         .filter_map(|p| {
             let (a, b) = span(text, p);
-            (a < b).then(|| Mark { start: offsets[a], end: offsets[b], color: p.severity.color() })
+            (a < b).then(|| Mark::underline(offsets[a], offsets[b], p.severity.color()))
         })
         .collect()
 }

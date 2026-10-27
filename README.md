@@ -67,6 +67,7 @@ botão **Compactar imagens** faz o mesmo nas já instaladas. Medido nas três im
 - [x] Build via Gradle, com erros do Kotlin, javac e aapt2 clicáveis no painel de saída
 - [x] Executar: instala o APK no emulador e abre o app; Captura salva a tela do emulador
 - [x] Simulador: tela ao vivo no painel, mouse como dedo, teclado e botões de hardware
+- [x] Busca no editor (com substituição), busca em arquivos e criar arquivo e pasta pelo app
 - [x] Autocomplete via LSP para Java (jdtls) e Kotlin (kotlin-language-server), com classes do Android
 
 ## Logcat e terminal
@@ -105,6 +106,25 @@ O app de exemplo gerado tem um botão contador e um campo de texto justamente pa
 Limitações: a tela não gira (o toque é gravado nas coordenadas do painel em pé); não há multitoque
 (pinça) nem sensores; a taxa de quadros depende do emulador (sem placa de vídeo é a do `screencap`);
 as imagens ATD não desenham a interface e o painel mostra preto.
+
+## Buscar e criar arquivos
+
+- **Ctrl+F** abre a barra de busca do arquivo aberto: todas as ocorrências ficam com fundo amarelo e a atual
+  em laranja; **Enter** / **F3** vão para a próxima e **Shift+Enter** / **Shift+F3** para a anterior, dando a
+  volta no arquivo. **Aa** diferencia maiúsculas e minúsculas, **Esc** fecha.
+- **Ctrl+H** mostra a substituição: **Substituir** troca a ocorrência atual e pula para a próxima, e **Todas** troca
+  tudo (vale como edição normal: o arquivo fica modificado até você salvar com Ctrl+S).
+- **Ctrl+Shift+F** abre a busca em todos os arquivos do projeto (ícone da lupa): os resultados chegam aos poucos,
+  agrupados por arquivo, e clicar abre o arquivo e já seleciona a ocorrência. Ignora `.git`, `build`, `.gradle`,
+  binários, arquivos acima de 1 MB e o que não é UTF-8; para em 2.000 resultados. Busca nos arquivos **salvos**.
+- **Novo arquivo** e **Nova pasta** no Explorador criam na pasta escolhida (clique numa pasta da árvore, ou use o
+  botão direito nela). O nome pode ter subpastas (`app/src/Tela.kt`). Um `.kt` ou `.java` dentro de
+  `src/<conjunto>/java|kotlin/...` já nasce com o `package` certo e uma classe vazia, e o arquivo abre no editor.
+  Nomes que saem da pasta (`..`), caminhos absolutos, caracteres e nomes reservados do Windows (`con`, `nul`…) e
+  o que já existe são recusados, sem sobrescrever nada.
+
+Testado dirigindo o app com eventos de teclado simulados (sem janela): atalhos, digitação nas caixas, navegação,
+substituição, busca em arquivos e criação, além dos testes unitários da busca, da substituição e da validação de nomes.
 
 ## Problemas (erros sublinhados)
 

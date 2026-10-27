@@ -206,18 +206,33 @@ fn color(t: Tok) -> Color32 {
     }
 }
 
-/// Um trecho a sublinhar (erro, aviso…), em bytes do texto.
+/// Um trecho destacado, em bytes do texto: sublinhado (erro, aviso…) ou com fundo colorido (achado da busca).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mark {
     pub start: usize,
     pub end: usize,
     pub color: Color32,
+    /// `true`: pinta o fundo; `false`: sublinha.
+    pub fill: bool,
 }
+
+impl Mark {
+    pub fn underline(start: usize, end: usize, color: Color32) -> Self {
+        Self { start, end, color, fill: false }
+    }
+
+    pub fn fill(start: usize, end: usize, color: Color32) -> Self {
+        Self { start, end, color, fill: true }
+    }
+}
+
+/// Um pedaço do texto com o estilo final: `(início, fim, tipo, cor do sublinhado, cor do fundo)`.
+pub type Segment = (usize, usize, Tok, Option<Color32>, Option<Color32>);
 
 /// Os tokens, cortados nas bordas das marcas. Cada pedaço diz se fica sublinhado (e de que cor); com mais
 /// de uma marca no mesmo lugar vale a primeira da lista. Marcas fora do texto ou que cortariam um caractere
 /// no meio são ignoradas (o texto pode ter mudado desde que elas foram calculadas).
-pub fn segments(text: &str, lang: Lang, marks: &[Mark]) -> Vec<(usize, usize, Tok, Option<Color32>)> {
+pub fn segments(text: &str, lang: Lang, marks: &[Mark]) -> Vec<Segment> {
     let valid: Vec<&Mark> =
         marks.iter().filter(|m| m.start < m.end && m.end <= text.len() && text.is_char_boundary(m.start) && text.is_char_boundary(m.end)).collect();
     let mut out = Vec::new();
@@ -229,8 +244,8 @@ pub fn segments(text: &str, lang: Lang, marks: &[Mark]) -> Vec<(usize, usize, To
         cuts.sort_unstable();
         cuts.dedup();
         for w in cuts.windows(2) {
-            let under = valid.iter().find(|m| m.start <= w[0] && w[1] <= m.end).map(|m| m.color);
-            out.push((w[0], w[1], t, under));
+            let covering = |fill: bool| valid.iter().find(|m| m.fill == fill && m.start <= w[0] && w[1] <= m.end).map(|m| m.color);
+            out.push((w[0], w[1], t, covering(false), covering(true)));
         }
     }
     out
@@ -241,10 +256,13 @@ pub fn segments(text: &str, lang: Lang, marks: &[Mark]) -> Vec<(usize, usize, To
 pub fn layout_job(text: &str, lang: Lang, font: FontId, marks: &[Mark]) -> LayoutJob {
     let mut job = LayoutJob::default();
     job.wrap.max_width = f32::INFINITY;
-    for (a, b, t, under) in segments(text, lang, marks) {
+    for (a, b, t, under, fill) in segments(text, lang, marks) {
         let mut format = TextFormat::simple(font.clone(), color(t));
         if let Some(c) = under {
             format.underline = Stroke::new(1.5, c);
+        }
+        if let Some(c) = fill {
+            format.background = c;
         }
         job.append(&text[a..b], 0.0, format);
     }
@@ -264,7 +282,7 @@ mod tests {
         let text = "val x: Int = \"texto\" // ok";
         let start = text.find("\"texto\"").unwrap();
         let red = Color32::RED;
-        let seg = segments(text, Lang::Kotlin, &[Mark { start: start + 1, end: start + 6, color: red }]);
+        let seg = segments(text, Lang::Kotlin, &[Mark::underline(start + 1, start + 6, red)]);
         let under: String = seg.iter().filter(|s| s.3 == Some(red)).map(|s| &text[s.0..s.1]).collect();
         assert_eq!(under, "texto", "só o trecho marcado, que está no meio de um token de texto");
         let all: String = seg.iter().map(|s| &text[s.0..s.1]).collect();
@@ -275,9 +293,9 @@ mod tests {
     fn invalid_marks_are_ignored_instead_of_panicking() {
         let text = "ação";
         let marks = [
-            Mark { start: 2, end: 3, color: Color32::RED }, // no meio do "ç"
-            Mark { start: 0, end: 99, color: Color32::RED }, // além do fim
-            Mark { start: 3, end: 3, color: Color32::RED },  // vazia
+            Mark::underline(2, 3, Color32::RED), // no meio do "ç"
+            Mark::underline(0, 99, Color32::RED), // além do fim
+            Mark::underline(3, 3, Color32::RED),  // vazia
         ];
         let seg = segments(text, Lang::Plain, &marks);
         assert!(seg.iter().all(|s| s.3.is_none()));
@@ -287,10 +305,21 @@ mod tests {
     }
 
     #[test]
+    fn fill_and_underline_marks_combine_independently() {
+        let text = "abcdef";
+        let (red, yellow) = (Color32::RED, Color32::YELLOW);
+        let seg = segments(text, Lang::Plain, &[Mark::underline(1, 4, red), Mark::fill(2, 5, yellow)]);
+        let at = |i: usize| seg.iter().find(|s| s.0 <= i && i < s.1).map(|s| (s.3, s.4)).unwrap();
+        assert_eq!((at(0), at(1), at(2), at(4), at(5)), ((None, None), (Some(red), None), (Some(red), Some(yellow)), (None, Some(yellow)), (None, None)));
+        let job = layout_job(text, Lang::Plain, FontId::monospace(14.0), &[Mark::fill(1, 3, yellow)]);
+        assert!(job.sections.iter().any(|s| s.format.background == yellow), "o fundo chega ao texto desenhado");
+    }
+
+    #[test]
     fn the_first_mark_wins_where_they_overlap() {
         let text = "abcdef";
         let (red, yellow) = (Color32::RED, Color32::YELLOW);
-        let seg = segments(text, Lang::Plain, &[Mark { start: 1, end: 3, color: red }, Mark { start: 2, end: 5, color: yellow }]);
+        let seg = segments(text, Lang::Plain, &[Mark::underline(1, 3, red), Mark::underline(2, 5, yellow)]);
         let color_of = |i: usize| seg.iter().find(|s| s.0 <= i && i < s.1).and_then(|s| s.3);
         assert_eq!((color_of(0), color_of(1), color_of(2), color_of(3), color_of(5)), (None, Some(red), Some(red), Some(yellow), None));
     }

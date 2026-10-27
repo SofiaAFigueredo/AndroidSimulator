@@ -11,6 +11,8 @@ use crate::terminal::Terminal;
 use crate::lsp;
 use crate::problems::{self, Problem};
 use crate::project;
+use crate::files;
+use crate::search::{self, Hit};
 use crate::servers;
 use crate::simulator::SimulatorView;
 use crate::toolchain;
@@ -18,7 +20,9 @@ use crate::sdk::{self, Event};
 use eframe::egui::{self, Color32, RichText};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 
 const BG: Color32 = Color32::from_rgb(0x1e, 0x1e, 0x1e);
 const SIDEBAR: Color32 = Color32::from_rgb(0x25, 0x25, 0x26);
@@ -38,9 +42,10 @@ enum Bottom {
     Terminal,
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Clone, Copy, Debug)]
 enum View {
     Explorer,
+    Search,
     Devices,
 }
 
@@ -52,6 +57,47 @@ struct Tab {
     goto: Option<u32>,
     /// Versão do documento no servidor de linguagem; 0 enquanto não foi aberto lá.
     lsp_version: i32,
+}
+
+/// A barra de busca do editor (Ctrl+F) e a de substituição (Ctrl+H).
+#[derive(Default)]
+struct Find {
+    open: bool,
+    show_replace: bool,
+    query: String,
+    replace: String,
+    case_sensitive: bool,
+    /// Pedir o foco para a caixa de busca no próximo quadro.
+    focus: bool,
+    /// Índice da ocorrência selecionada e o trecho dela, em bytes.
+    current: Option<usize>,
+    selected: Option<(usize, usize)>,
+}
+
+enum SearchMsg {
+    File(Vec<Hit>),
+    Done(search::Stats),
+}
+
+/// A busca em todos os arquivos do projeto (Ctrl+Shift+F).
+#[derive(Default)]
+struct SearchState {
+    query: String,
+    case_sensitive: bool,
+    /// Resultados agrupados por arquivo, na ordem em que chegam.
+    results: Vec<(PathBuf, Vec<Hit>)>,
+    rx: Option<Receiver<SearchMsg>>,
+    cancel: Option<Arc<AtomicBool>>,
+    stats: Option<search::Stats>,
+    focus: bool,
+}
+
+/// O formulário de arquivo ou pasta novos, no Explorador.
+struct NewEntry {
+    folder: bool,
+    name: String,
+    error: Option<String>,
+    focus: bool,
 }
 
 /// Pedido de completion em andamento.
@@ -103,6 +149,11 @@ pub struct App {
     ac: AutoComplete,
     /// A tela do dispositivo ao vivo, no painel da direita.
     sim: SimulatorView,
+    find: Find,
+    search: SearchState,
+    new_entry: Option<NewEntry>,
+    /// A pasta escolhida no Explorador (onde o arquivo novo é criado).
+    explorer_sel: PathBuf,
     /// O que o Gradle reclamou na última compilação, por arquivo (chave: `lsp::uri_key`); é apagado do
     /// arquivo que o usuário edita, porque as posições deixam de valer.
     build_problems: HashMap<String, (PathBuf, Vec<Problem>)>,
@@ -165,6 +216,10 @@ impl App {
             pending_license: None,
             ac: AutoComplete::default(),
             sim: SimulatorView::default(),
+            find: Find::default(),
+            search: SearchState::default(),
+            new_entry: None,
+            explorer_sel: folder.clone(),
             build_problems: HashMap::new(),
             show_sim: false,
             separate_window: false,
@@ -364,7 +419,7 @@ impl App {
             .frame(egui::Frame::new().fill(ACTIVITY))
             .show(ui, |ui| {
                 ui.add_space(6.0);
-                for (view, tip) in [(View::Explorer, "Explorador"), (View::Devices, "Dispositivos")] {
+                for (view, tip) in [(View::Explorer, "Explorador"), (View::Search, "Busca nos arquivos (Ctrl+Shift+F)"), (View::Devices, "Dispositivos")] {
                     let on = self.view == view;
                     let (rect, resp) = ui.allocate_exact_size(egui::vec2(48.0, 48.0), egui::Sense::click());
                     let color = if on || resp.hovered() { Color32::WHITE } else { MUTED };
@@ -396,6 +451,7 @@ impl App {
             .frame(egui::Frame::new().fill(SIDEBAR).inner_margin(8.0))
             .show(ui, |ui| match self.view {
                 View::Explorer => self.explorer(ui),
+                View::Search => self.search_view(ui),
                 View::Devices => self.devices(ui),
             });
     }
@@ -410,6 +466,17 @@ impl App {
                 self.folder = PathBuf::from(&self.folder_input);
             }
         });
+        ui.horizontal(|ui| {
+            if ui.button("Novo arquivo").on_hover_text("Cria na pasta escolhida na árvore (clique numa pasta para escolher)").clicked() {
+                self.new_entry = Some(NewEntry { folder: false, name: String::new(), error: None, focus: true });
+            }
+            if ui.button("Nova pasta").clicked() {
+                self.new_entry = Some(NewEntry { folder: true, name: String::new(), error: None, focus: true });
+            }
+        });
+        if self.new_entry.is_some() {
+            self.new_entry_form(ui);
+        }
         let versions = self.build_versions();
         let is_project = self.folder.join("settings.gradle.kts").exists();
         ui.horizontal(|ui| {
@@ -451,10 +518,22 @@ impl App {
         }
         ui.separator();
         let mut to_open = None;
+        let (mut select, mut new_in) = (None, None);
         egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
             let folder = self.folder.clone();
-            tree(ui, &folder, &mut to_open);
+            let root_name = folder.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| folder.display().to_string());
+            if ui.selectable_label(self.explorer_sel == folder, format!("{root_name}  (pasta raiz)")).clicked() {
+                select = Some(folder.clone());
+            }
+            tree(ui, &folder, &mut to_open, &self.explorer_sel, &mut select, &mut new_in);
         });
+        if let Some(p) = select {
+            self.explorer_sel = p;
+        }
+        if let Some((p, is_folder)) = new_in {
+            self.explorer_sel = p;
+            self.new_entry = Some(NewEntry { folder: is_folder, name: String::new(), error: None, focus: true });
+        }
         if let Some(p) = to_open {
             self.open_file(&p);
         }
@@ -774,6 +853,383 @@ impl App {
         }
     }
 
+    /// Atalhos de busca: Ctrl+F (no arquivo), Ctrl+H (substituir), Ctrl+Shift+F (nos arquivos) e F3.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        use egui::{Key, Modifiers};
+        // As variantes com Shift primeiro: o egui deixa um Ctrl+Shift+F também casar com Ctrl+F.
+        let (search_all, find, replace, prev, next) = ctx.input_mut(|i| {
+            (
+                i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::F),
+                i.consume_key(Modifiers::COMMAND, Key::F),
+                i.consume_key(Modifiers::COMMAND, Key::H),
+                i.consume_key(Modifiers::SHIFT, Key::F3),
+                i.consume_key(Modifiers::NONE, Key::F3),
+            )
+        });
+        if search_all {
+            self.view = View::Search;
+            self.search.focus = true;
+        }
+        if (find || replace) && !self.tabs.is_empty() {
+            self.find.open = true;
+            self.find.focus = true;
+            self.find.show_replace |= replace;
+        }
+        if (prev || next) && !self.find.query.is_empty() && !self.tabs.is_empty() {
+            self.find.open = true;
+            self.find_jump(!prev);
+        }
+    }
+
+    /// Seleciona a ocorrência `idx` de `matches` no arquivo ativo e rola até ela.
+    fn select_match(&mut self, idx: usize, matches: &[(usize, usize)]) {
+        let Some(t) = self.tabs.get_mut(self.active) else { return };
+        let Some(&(a, b)) = matches.get(idx) else { return };
+        self.find.current = Some(idx);
+        self.find.selected = Some((a, b));
+        let (from, to) = (t.text[..a].chars().count(), t.text[..b].chars().count());
+        self.set_cursor = Some((from, to));
+        self.cursor = to;
+        t.goto = Some(t.text[..a].matches('\n').count() as u32 + 1);
+    }
+
+    /// Vai para a próxima (ou anterior) ocorrência da busca, dando a volta no arquivo.
+    fn find_jump(&mut self, forward: bool) {
+        let Some(t) = self.tabs.get(self.active) else { return };
+        let matches = search::find_all(&t.text, &self.find.query, self.find.case_sensitive);
+        if matches.is_empty() {
+            self.find.current = None;
+            self.find.selected = None;
+            return;
+        }
+        let cursor_byte = char_to_byte(&t.text, self.cursor);
+        // Se a ocorrência selecionada ainda é a que a busca marcou, anda a partir dela.
+        let idx = match self.find.current.filter(|c| self.find.selected == matches.get(*c).copied()) {
+            Some(c) => search::step(c, matches.len(), forward),
+            None if forward => search::pick_from(&matches, cursor_byte).unwrap_or(0),
+            None => search::pick_before(&matches, cursor_byte),
+        };
+        self.select_match(idx, &matches);
+    }
+
+    /// A consulta mudou: seleciona a primeira ocorrência a partir de onde a anterior estava.
+    fn find_refresh(&mut self) {
+        let Some(t) = self.tabs.get(self.active) else { return };
+        let matches = search::find_all(&t.text, &self.find.query, self.find.case_sensitive);
+        let from = self.find.selected.map_or_else(|| char_to_byte(&t.text, self.cursor), |s| s.0);
+        self.find.current = None;
+        self.find.selected = None;
+        if let Some(i) = search::pick_from(&matches, from) {
+            self.select_match(i, &matches);
+        }
+    }
+
+    /// Troca o texto do arquivo ativo (substituição) e avisa o servidor de linguagem.
+    fn edit_active(&mut self, text: String) {
+        let Some(t) = self.tabs.get_mut(self.active) else { return };
+        t.text = text;
+        t.dirty = true;
+        let uri = lsp::path_to_uri(&t.path);
+        self.build_problems.remove(&lsp::uri_key(&uri));
+        if t.lsp_version > 0 {
+            t.lsp_version += 1;
+            if let Some(c) = self.ac.client(highlight::lang_for(&t.path)) {
+                let _ = c.did_change(&uri, t.lsp_version, &t.text);
+            }
+        }
+        self.popup = None;
+    }
+
+    fn replace_current(&mut self) {
+        let Some(t) = self.tabs.get(self.active) else { return };
+        let matches = search::find_all(&t.text, &self.find.query, self.find.case_sensitive);
+        match self.find.selected.filter(|s| matches.contains(s)) {
+            None => self.find_jump(true),
+            Some(sel) => {
+                let after = t.text[..sel.0].chars().count() + self.find.replace.chars().count();
+                let new = search::replace_range(&t.text, sel, &self.find.replace);
+                self.edit_active(new);
+                self.cursor = after;
+                self.find.current = None;
+                self.find.selected = None;
+                self.find_jump(true);
+            }
+        }
+    }
+
+    fn replace_all(&mut self) {
+        let Some(t) = self.tabs.get(self.active) else { return };
+        let (new, n) = search::replace_all(&t.text, &self.find.query, &self.find.replace, self.find.case_sensitive);
+        if n > 0 {
+            self.edit_active(new);
+            self.find.current = None;
+            self.find.selected = None;
+            self.log.push(format!("{n} ocorrência(s) substituída(s)."));
+        }
+    }
+
+    /// A barra de busca (e de substituição) acima do editor.
+    fn find_bar(&mut self, ui: &mut egui::Ui) {
+        let total = self.tabs.get(self.active).map_or(0, |t| search::find_all(&t.text, &self.find.query, self.find.case_sensitive).len());
+        let (mut jump, mut close, mut refresh, mut replace_one, mut replace_every) = (None, false, false, false, false);
+        ui.horizontal(|ui| {
+            let r = ui.add(egui::TextEdit::singleline(&mut self.find.query).id(egui::Id::unique("find-query")).hint_text("Buscar").desired_width(220.0));
+            if self.find.focus {
+                r.request_focus();
+                self.find.focus = false;
+            }
+            if r.changed() {
+                refresh = true;
+            }
+            let (enter, shift, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.modifiers.shift, i.key_pressed(egui::Key::Escape)));
+            if r.lost_focus() && enter {
+                jump = Some(!shift);
+                r.request_focus();
+            }
+            if (r.has_focus() || r.lost_focus()) && esc {
+                close = true;
+            }
+            if ui.selectable_label(self.find.case_sensitive, "Aa").on_hover_text("Diferenciar maiúsculas e minúsculas").clicked() {
+                self.find.case_sensitive = !self.find.case_sensitive;
+                refresh = true;
+            }
+            let count = if self.find.query.is_empty() {
+                String::new()
+            } else if total == 0 {
+                "sem resultados".to_owned()
+            } else {
+                match self.find.current {
+                    Some(c) => format!("{} de {total}", c + 1),
+                    None => format!("{total} resultados"),
+                }
+            };
+            ui.label(RichText::new(count).small().color(MUTED));
+            if ui.small_button("<").on_hover_text("Anterior (Shift+F3)").clicked() {
+                jump = Some(false);
+            }
+            if ui.small_button(">").on_hover_text("Próxima (F3)").clicked() {
+                jump = Some(true);
+            }
+            if ui.small_button("Substituir…").on_hover_text("Mostrar ou esconder a substituição (Ctrl+H)").clicked() {
+                self.find.show_replace = !self.find.show_replace;
+            }
+            if ui.small_button("×").on_hover_text("Fechar (Esc)").clicked() {
+                close = true;
+            }
+        });
+        if self.find.show_replace {
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.find.replace).hint_text("Substituir por").desired_width(220.0));
+                if ui.small_button("Substituir").clicked() {
+                    replace_one = true;
+                }
+                if ui.small_button("Todas").clicked() {
+                    replace_every = true;
+                }
+            });
+        }
+        if refresh {
+            self.find_refresh();
+        }
+        if let Some(forward) = jump {
+            self.find_jump(forward);
+        }
+        if replace_one {
+            self.replace_current();
+        }
+        if replace_every {
+            self.replace_all();
+        }
+        if close {
+            self.find.open = false;
+        }
+    }
+
+    /// Começa a busca nos arquivos do projeto, numa thread; os resultados chegam aos poucos.
+    fn start_search(&mut self, ctx: &egui::Context) {
+        if let Some(c) = self.search.cancel.take() {
+            c.store(true, Ordering::Relaxed);
+        }
+        self.search.results.clear();
+        self.search.stats = None;
+        self.search.rx = None;
+        if self.search.query.is_empty() {
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.search.cancel = Some(Arc::clone(&cancel));
+        let (tx, rx) = mpsc::channel();
+        self.search.rx = Some(rx);
+        let (root, query, case, ctx) = (self.folder.clone(), self.search.query.clone(), self.search.case_sensitive, ctx.clone());
+        std::thread::spawn(move || {
+            let (files_tx, files_ctx) = (tx.clone(), ctx.clone());
+            let stats = search::search_dir(&root, &query, case, &cancel, |hits| {
+                let _ = files_tx.send(SearchMsg::File(hits));
+                files_ctx.request_repaint();
+            });
+            let _ = tx.send(SearchMsg::Done(stats));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_search(&mut self) {
+        let Some(rx) = &self.search.rx else { return };
+        let mut done = false;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                SearchMsg::File(hits) => {
+                    if let Some(first) = hits.first() {
+                        let path = first.path.clone();
+                        self.search.results.push((path, hits));
+                    }
+                }
+                SearchMsg::Done(stats) => {
+                    self.search.stats = Some(stats);
+                    done = true;
+                }
+            }
+        }
+        if done {
+            self.search.rx = None;
+        }
+    }
+
+    /// Abre o arquivo do resultado e seleciona a ocorrência.
+    fn open_hit(&mut self, hit: &Hit) {
+        self.open_file_at(&hit.path, hit.line as u32);
+        if let Some(t) = self.tabs.iter().find(|t| t.path == hit.path) {
+            let from = search::char_offset(&t.text, hit.line, hit.col);
+            self.set_cursor = Some((from, from + hit.len));
+            self.cursor = from + hit.len;
+        }
+    }
+
+    /// A aba de busca nos arquivos.
+    fn search_view(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("BUSCA").small().color(MUTED));
+        let mut run = false;
+        ui.horizontal(|ui| {
+            let r = ui.add(egui::TextEdit::singleline(&mut self.search.query).hint_text("Buscar nos arquivos").desired_width(ui.available_width() - 90.0));
+            if self.search.focus {
+                r.request_focus();
+                self.search.focus = false;
+            }
+            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                run = true;
+                r.request_focus();
+            }
+            if ui.selectable_label(self.search.case_sensitive, "Aa").on_hover_text("Diferenciar maiúsculas e minúsculas").clicked() {
+                self.search.case_sensitive = !self.search.case_sensitive;
+                run = !self.search.query.is_empty();
+            }
+            if ui.button("Ir").clicked() {
+                run = true;
+            }
+        });
+        if run {
+            self.start_search(&ui.ctx().clone());
+        }
+        let folder = self.folder.clone();
+        ui.label(RichText::new(format!("em {} (arquivos salvos)", folder.display())).small().color(MUTED));
+        if self.search.rx.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Buscando…");
+            });
+        } else if let Some(stats) = &self.search.stats {
+            let more = if stats.truncated { " (limite de resultados atingido: refine a busca)" } else { "" };
+            ui.label(RichText::new(format!("{} resultado(s) em {} arquivo(s){more}", stats.hits, self.search.results.len())).small());
+        }
+        ui.separator();
+        let mut open = None;
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            for (path, hits) in &self.search.results {
+                let rel = path.strip_prefix(&folder).unwrap_or(path).display().to_string();
+                egui::CollapsingHeader::new(format!("{rel} ({})", hits.len())).id_salt(path).default_open(true).show(ui, |ui| {
+                    for h in hits {
+                        let line = RichText::new(format!("{:>4}: {}", h.line, h.preview)).monospace().small();
+                        if ui.selectable_label(false, line).clicked() {
+                            open = Some(h.clone());
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(hit) = open {
+            self.open_hit(&hit);
+        }
+    }
+
+    /// A pasta onde o arquivo ou pasta novos serão criados: a escolhida na árvore, se for do projeto.
+    fn new_entry_target(&self) -> PathBuf {
+        if self.explorer_sel.is_dir() && self.explorer_sel.starts_with(&self.folder) { self.explorer_sel.clone() } else { self.folder.clone() }
+    }
+
+    fn create_entry(&mut self) {
+        let Some(entry) = &self.new_entry else { return };
+        let (is_folder, name) = (entry.folder, entry.name.clone());
+        let base = self.new_entry_target();
+        let result = if is_folder { files::create_dir(&base, &name) } else { files::create_file(&base, &name) };
+        match result {
+            Ok(path) => {
+                self.log.push(format!("Criado {}.", path.display()));
+                if is_folder {
+                    self.explorer_sel = path;
+                } else {
+                    self.explorer_sel = path.parent().map(Path::to_path_buf).unwrap_or(base);
+                    self.open_file(&path);
+                }
+                self.new_entry = None;
+            }
+            Err(e) => {
+                if let Some(entry) = &mut self.new_entry {
+                    entry.error = Some(e);
+                }
+            }
+        }
+    }
+
+    fn new_entry_form(&mut self, ui: &mut egui::Ui) {
+        let target = self.new_entry_target();
+        let rel = target.strip_prefix(&self.folder).map(|p| p.display().to_string()).unwrap_or_default();
+        let rel = if rel.is_empty() { ".".to_owned() } else { rel };
+        let (mut create, mut cancel) = (false, false);
+        let Some(entry) = &mut self.new_entry else { return };
+        ui.label(RichText::new(format!("{} em {rel}", if entry.folder { "Nova pasta" } else { "Novo arquivo" })).small().color(MUTED));
+        ui.horizontal(|ui| {
+            let hint = if entry.folder { "nome ou caminho/da/pasta" } else { "Nome.kt ou pasta/Nome.kt" };
+            let r = ui.add(egui::TextEdit::singleline(&mut entry.name).hint_text(hint).desired_width(ui.available_width() - 100.0));
+            if entry.focus {
+                r.request_focus();
+                entry.focus = false;
+            }
+            if r.changed() {
+                entry.error = None;
+            }
+            let (enter, esc) = ui.input(|i| (i.key_pressed(egui::Key::Enter), i.key_pressed(egui::Key::Escape)));
+            if r.lost_focus() && enter {
+                create = true;
+            }
+            if (r.has_focus() || r.lost_focus()) && esc {
+                cancel = true;
+            }
+            if ui.button("Criar").clicked() {
+                create = true;
+            }
+            if ui.button("×").clicked() {
+                cancel = true;
+            }
+        });
+        if let Some(e) = &entry.error {
+            ui.colored_label(Color32::LIGHT_RED, e.clone());
+        }
+        if cancel {
+            self.new_entry = None;
+        } else if create {
+            self.create_entry();
+        }
+    }
+
     fn compact(&mut self, ctx: &egui::Context) {
         let (tx, rx) = mpsc::channel();
         let (root, ctx) = (self.sdk_root.clone(), ctx.clone());
@@ -947,6 +1403,9 @@ impl App {
             self.active = self.active.min(self.tabs.len().saturating_sub(1));
             return;
         }
+        if self.find.open {
+            self.find_bar(ui);
+        }
         if let Some(t) = self.tabs.get_mut(self.active) {
             let lang = if t.text.len() > MAX_HIGHLIGHT_BYTES { highlight::Lang::Plain } else { highlight::lang_for(&t.path) };
             let font = egui::FontId::monospace(14.0);
@@ -967,7 +1426,11 @@ impl App {
 
             // Problemas deste arquivo (LSP + Gradle): viram o sublinhado e o tooltip.
             let tab_problems = tab_problems(&self.ac, &self.build_problems, t, path_lang, &uri);
-            let marks = problems::marks(&t.text, &tab_problems);
+            let mut marks = problems::marks(&t.text, &tab_problems);
+            if self.find.open && !self.find.query.is_empty() {
+                let found = search::find_all(&t.text, &self.find.query, self.find.case_sensitive);
+                marks.extend(find_marks(&found, self.find.selected));
+            }
 
             // Resposta do servidor a um pedido de completion.
             if let Some(p) = &self.pending {
@@ -1226,6 +1689,19 @@ fn tab_problems(ac: &AutoComplete, build: &HashMap<String, (PathBuf, Vec<Problem
     out
 }
 
+/// As ocorrências da busca como fundo colorido: a selecionada mais forte, e primeiro, para valer sobre as outras.
+fn find_marks(matches: &[(usize, usize)], selected: Option<(usize, usize)>) -> Vec<highlight::Mark> {
+    let all = Color32::from_rgba_unmultiplied(0xea, 0xc5, 0x4f, 90);
+    let current = Color32::from_rgba_unmultiplied(0xf2, 0x8b, 0x30, 190);
+    let mut out: Vec<highlight::Mark> = matches.iter().filter(|m| Some(**m) == selected).map(|(a, b)| highlight::Mark::fill(*a, *b, current)).collect();
+    out.extend(matches.iter().filter(|m| Some(**m) != selected).take(5000).map(|(a, b)| highlight::Mark::fill(*a, *b, all)));
+    out
+}
+
+fn char_to_byte(text: &str, char_idx: usize) -> usize {
+    text.char_indices().nth(char_idx).map_or(text.len(), |(b, _)| b)
+}
+
 /// Um celular com o triângulo de "executar" dentro.
 fn draw_simulator_icon(p: &egui::Painter, c: egui::Pos2, color: Color32) {
     let stroke = egui::Stroke::new(1.8, color);
@@ -1244,6 +1720,10 @@ fn draw_icon(p: &egui::Painter, c: egui::Pos2, view: View, color: Color32) {
             p.rect_filled(front, 1.0, ACTIVITY);
             p.rect_stroke(front, 1.0, stroke, egui::StrokeKind::Middle);
         }
+        View::Search => {
+            p.circle_stroke(c + egui::vec2(-2.0, -2.0), 7.0, stroke);
+            p.line_segment([c + egui::vec2(3.0, 3.0), c + egui::vec2(10.0, 10.0)], stroke);
+        }
         View::Devices => {
             let phone = egui::Rect::from_center_size(c, egui::vec2(14.0, 24.0));
             p.rect_stroke(phone, 3.0, stroke, egui::StrokeKind::Middle);
@@ -1252,7 +1732,7 @@ fn draw_icon(p: &egui::Painter, c: egui::Pos2, view: View, color: Color32) {
     }
 }
 
-fn tree(ui: &mut egui::Ui, dir: &Path, to_open: &mut Option<PathBuf>) {
+fn tree(ui: &mut egui::Ui, dir: &Path, to_open: &mut Option<PathBuf>, selected: &Path, on_select: &mut Option<PathBuf>, on_new: &mut Option<(PathBuf, bool)>) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     let mut entries: Vec<_> = rd.filter_map(Result::ok).collect();
     entries.sort_by_key(|e| (!e.path().is_dir(), e.file_name().to_string_lossy().to_lowercase()));
@@ -1263,7 +1743,21 @@ fn tree(ui: &mut egui::Ui, dir: &Path, to_open: &mut Option<PathBuf>) {
         }
         let path = e.path();
         if path.is_dir() {
-            egui::CollapsingHeader::new(name).id_salt(&path).show(ui, |ui| tree(ui, &path, to_open));
+            let label = if path == selected { RichText::new(name).color(ACCENT) } else { RichText::new(name) };
+            let r = egui::CollapsingHeader::new(label).id_salt(&path).show(ui, |ui| tree(ui, &path, to_open, selected, on_select, on_new));
+            if r.header_response.clicked() {
+                *on_select = Some(path.clone());
+            }
+            r.header_response.context_menu(|ui| {
+                if ui.button("Novo arquivo aqui").clicked() {
+                    *on_new = Some((path.clone(), false));
+                    ui.close();
+                }
+                if ui.button("Nova pasta aqui").clicked() {
+                    *on_new = Some((path.clone(), true));
+                    ui.close();
+                }
+            });
         } else if ui.selectable_label(false, format!("   {name}")).clicked() {
             *to_open = Some(path);
         }
@@ -1293,6 +1787,8 @@ impl eframe::App for App {
         let ctx = &ctx;
         self.poll(ctx);
         self.sync_language_servers(ctx);
+        self.handle_shortcuts(ctx);
+        self.poll_search();
         let problems = self.all_problems();
         self.logcat.poll();
         self.terminal.poll();
@@ -1389,3 +1885,7 @@ impl eframe::App for App {
 #[cfg(test)]
 #[path = "app_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "find_tests.rs"]
+mod find_tests;
